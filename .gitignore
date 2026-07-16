@@ -1,0 +1,18 @@
+# Artefatos de compilacao e diagnostico
+/AgenteBiometria.exe
+/build-err.txt
+*.log
+
+# Dados locais gerados pelo agente
+cert.pem
+key.pem
+agente-*.json
+origens-autorizadas.json
+
+# Python, editores e sistema operacional
+__pycache__/
+*.py[cod]
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
