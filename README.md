@@ -8,6 +8,7 @@
 ![Windows](https://img.shields.io/badge/Windows-x86-0078D4?style=for-the-badge&logo=windows&logoColor=white)
 ![NBioBSP](https://img.shields.io/badge/SDK-NBioBSP-6C63FF?style=for-the-badge)
 ![Status](https://img.shields.io/badge/status-em%20desenvolvimento-F59E0B?style=for-the-badge)
+![License](https://img.shields.io/badge/licen%C3%A7a-Apache%202.0-22C55E?style=for-the-badge)
 
 </div>
 
@@ -238,6 +239,12 @@ O curinga `*` não é aceito em `CORS_ORIGEM`.
 | `NBioBSP.dll nao encontrada` | Instale o SDK x86 ou configure `NBIOBSP_DLL`. |
 | Token expirado | Execute novamente `Biometria.garantirConexao()`. |
 | Navegador bloqueou localhost | Use o sistema em HTTPS e conceda a permissão de rede local. |
+
+## Licença
+
+Copyright © 2026 Leonardo de Oliveira.
+
+Distribuído sob a licença Apache 2.0. Consulte o arquivo [`LICENSE`](LICENSE) para conhecer os termos.
 
 ---
 
