@@ -45,6 +45,10 @@ type respostaWorker struct {
 	Texto   string `json:"texto,omitempty"`
 	Confere bool   `json:"confere,omitempty"`
 	ID      string `json:"id,omitempty"`
+	// Candidatos que nao puderam ser comparados. Precisa atravessar o
+	// processo: sem isso o agente nao tem como distinguir "nao e a pessoa" de
+	// "o cadastro dessa pessoa esta corrompido".
+	Ignorados []string `json:"ignorados,omitempty"`
 }
 
 var (
@@ -122,7 +126,11 @@ func atendePedido(sdk **nbio, dll string, pedido pedidoWorker) respostaWorker {
 			_ = (*sdk).encerra()
 			*sdk = nil
 		}
-		return respostaWorker{Erro: err.Error()}
+		// Preserva o que a operacao ja tinha apurado (candidatos ignorados, por
+		// exemplo): OK continua falso, entao o cliente le o erro, mas o
+		// diagnostico parcial nao se perde.
+		resposta.Erro = err.Error()
+		return resposta
 	}
 	resposta.OK = true
 	return resposta
@@ -140,8 +148,8 @@ func executaOperacao(sdk *nbio, pedido pedidoWorker) (respostaWorker, error) {
 		confere, err := sdk.comparaTextos(pedido.A, pedido.B)
 		return respostaWorker{Confere: confere}, err
 	case opIdentificar:
-		id, err := sdk.identifica(pedido.A, pedido.Candidatos)
-		return respostaWorker{ID: id, Confere: id != ""}, err
+		id, ignorados, err := sdk.identifica(pedido.A, pedido.Candidatos)
+		return respostaWorker{ID: id, Confere: id != "", Ignorados: ignorados}, err
 	}
 	return respostaWorker{}, fmt.Errorf("operacao desconhecida: %q", pedido.Op)
 }
@@ -323,13 +331,13 @@ func (c *clienteWorker) comparaTextos(a, b string) (bool, error) {
 	return r.Confere, err
 }
 
-func (c *clienteWorker) identifica(lida string, candidatos []candidatoJSON) (string, error) {
+func (c *clienteWorker) identifica(lida string, candidatos []candidatoJSON) (string, []string, error) {
 	limite := 30*time.Second + time.Duration(len(candidatos))*25*time.Millisecond
 	if limite > 3*time.Minute {
 		limite = 3 * time.Minute
 	}
 	r, err := c.envia(pedidoWorker{Op: opIdentificar, A: lida, Candidatos: candidatos}, limite)
-	return r.ID, err
+	return r.ID, r.Ignorados, err
 }
 
 func (c *clienteWorker) encerra() error {

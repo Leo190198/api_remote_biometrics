@@ -88,7 +88,7 @@ type sdkAPI interface {
 	contaDispositivos() (uint32, error)
 	capturaTexto(uint16, int32) (string, error)
 	comparaTextos(string, string) (bool, error)
-	identifica(string, []candidatoJSON) (string, error)
+	identifica(string, []candidatoJSON) (string, []string, error)
 	encerra() error
 }
 
@@ -437,6 +437,13 @@ type candidatoJSON struct {
 	Template string `json:"template"`
 }
 
+// resultadoIdentificacao existe porque naThreadSDK carrega um valor so, e a
+// identificacao precisa devolver tambem quem ficou de fora.
+type resultadoIdentificacao struct {
+	id        string
+	ignorados []string
+}
+
 func handleIdentificar(w http.ResponseWriter, r *http.Request) {
 	if !permiteMetodo(w, r, http.MethodPost) {
 		return
@@ -474,19 +481,16 @@ func handleIdentificar(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ids := make(map[string]struct{}, len(body.Candidatos))
+	validos := make([]candidatoJSON, 0, len(body.Candidatos))
+	// Comeca vazia, e nao nula, para o campo sair como [] no JSON e o cliente
+	// nao precisar tratar null.
+	ignorados := []string{}
 	for i := range body.Candidatos {
 		c := &body.Candidatos[i]
+		// Id ausente ou repetido e defeito de quem chamou, e nao dado
+		// corrompido: continua sendo 400, porque o resultado seria ambiguo.
 		if c.ID == "" || len(c.ID) > 256 {
 			escreveErro(w, http.StatusBadRequest, fmt.Sprintf("candidato invalido na posicao %d", i))
-			return
-		}
-		// Apontar qual registro esta corrompido importa: sem isso, achar a
-		// linha ruim no meio de milhares de candidatos vira tentativa e erro.
-		c.Template = normalizaTemplate(c.Template)
-		if c.Template == "" {
-			registraErro("identificacao: template invalido no candidato %q (posicao %d)", c.ID, i)
-			escreveErro(w, http.StatusBadRequest,
-				fmt.Sprintf("template invalido no candidato %q (posicao %d)", c.ID, i))
 			return
 		}
 		if _, duplicado := ids[c.ID]; duplicado {
@@ -494,22 +498,46 @@ func handleIdentificar(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		ids[c.ID] = struct{}{}
+		// Ja um cadastro corrompido nao pode bloquear a identificacao dos
+		// outros: registra qual e, deixa de fora e segue com o resto da lista.
+		c.Template = normalizaTemplate(c.Template)
+		if c.Template == "" {
+			registraErro("identificacao: template ilegivel no candidato %q (posicao %d), ignorado", c.ID, i)
+			ignorados = append(ignorados, c.ID)
+			continue
+		}
+		validos = append(validos, *c)
+	}
+	if len(validos) == 0 {
+		escreveErro(w, http.StatusUnprocessableEntity, "nenhum candidato tem template utilizavel")
+		return
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 4*time.Minute)
 	defer cancel()
-	id, err := naThreadSDK(ctx, func() (string, error) {
+	res, err := naThreadSDK(ctx, func() (resultadoIdentificacao, error) {
 		s, err := ensureSDK()
 		if err != nil {
-			return "", err
+			return resultadoIdentificacao{}, err
 		}
-		return s.identifica(body.Lida, body.Candidatos)
+		id, pulados, err := s.identifica(body.Lida, validos)
+		return resultadoIdentificacao{id: id, ignorados: pulados}, err
 	})
 	if err != nil {
 		registraErro("identificacao: %v", err)
 		escreveErro(w, http.StatusBadGateway, err.Error())
 		return
 	}
-	escreveJSON(w, http.StatusOK, map[string]any{"ok": true, "confere": id != "", "id": id})
+	ignorados = append(ignorados, res.ignorados...)
+	if len(ignorados) > 0 && res.id == "" {
+		// Sem isso o sistema le "nao confere" e conclui que nao e a pessoa,
+		// quando na verdade o cadastro dela nao pode nem ser comparado.
+		registraErro("identificacao: nenhum candidato conferiu e %d cadastro(s) foram ignorados: %v",
+			len(ignorados), ignorados)
+	}
+	escreveJSON(w, http.StatusOK, map[string]any{
+		"ok": true, "confere": res.id != "", "id": res.id,
+		"ignorados": ignorados,
+	})
 }
 
 func escolheListener() (net.Listener, int, error) {

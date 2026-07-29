@@ -3,6 +3,7 @@
 package main
 
 import (
+	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -19,12 +20,31 @@ const (
 	purposeVerify  = 1
 	purposeEnroll  = 3
 	formTextEncode = 4
+
+	// NBioAPIERROR_INTERNAL_CHECKSUM_FAIL. O SDK assina o template e confere a
+	// assinatura no VerifyMatch; este codigo significa que os bytes recebidos
+	// nao sao os que o SDK gerou no cadastro. Nunca e falha de leitor nem de
+	// dedo: e o dado que chegou diferente de como saiu.
+	erroChecksum = 0x000B
 )
 
+// Faixa geral (NBioAPIERROR_BASE_GENERAL = 0), conforme o cabecalho do SDK.
+// Sem esses nomes, um template alterado no banco aparecia so como
+// "Erro 0x000B do SDK NBioBSP", que nao diz a ninguem o que fazer.
 var erros = map[uint32]string{
 	0x0000: "Sucesso",
 	0x0001: "Handle invalido",
+	0x0002: "Ponteiro invalido",
+	0x0003: "Tipo invalido",
 	0x0004: "Falha na funcao",
+	0x0005: "Tipo de estrutura nao corresponde",
+	0x0006: "Dado ja processado",
+	0x0007: "Falha ao abrir o extrator",
+	0x0008: "Falha ao abrir o verificador",
+	0x0009: "Falha ao processar o dado",
+	0x000A: "O dado precisa estar processado",
+	0x000B: "Template adulterado: o checksum interno nao confere com o conteudo",
+	0x000C: "Erro no dado criptografado",
 	0x0017: "Template invalido",
 	0x0101: "Falha ao abrir o dispositivo",
 	0x0102: "Nenhum leitor encontrado",
@@ -351,6 +371,15 @@ func templateValido(t string) bool {
 	return normalizaTemplate(t) != ""
 }
 
+// impressaoTemplate descreve um template no log sem expor o dado biometrico:
+// so o tamanho e um resumo curto. E o bastante para reconhecer o mesmo
+// registro entre execucoes e para flagrar truncamento — varios templates
+// parando exatamente no mesmo tamanho denunciam coluna curta no banco.
+func impressaoTemplate(t string) string {
+	soma := sha256.Sum256([]byte(t))
+	return fmt.Sprintf("%d bytes sha256:%x", len(t), soma[:6])
+}
+
 func (n *nbio) comparaTextos(a, b string) (bool, error) {
 	limpoA, limpoB := normalizaTemplate(a), normalizaTemplate(b)
 	if limpoA == "" || limpoB == "" {
@@ -367,6 +396,10 @@ func (n *nbio) comparaTextos(a, b string) (bool, error) {
 	}
 	r, _, _ := n.verify.Call(n.h, inA, inB, saida, 0)
 	if r != 0 {
+		if uint32(r) == erroChecksum {
+			registraErro("VerifyMatch recusou o par por checksum: cadastrado %s; lido %s",
+				impressaoTemplate(limpoA), impressaoTemplate(limpoB))
+		}
 		return false, novoErroSDK(uint32(r), "NBioAPI_VerifyMatch")
 	}
 	resultado, err := leUint32Nativo(saida)
@@ -376,47 +409,66 @@ func (n *nbio) comparaTextos(a, b string) (bool, error) {
 	return resultado != 0, nil
 }
 
-func (n *nbio) identifica(lida string, candidatos []candidatoJSON) (string, error) {
+// identifica devolve o id do candidato que conferiu e a lista dos que nao
+// puderam ser comparados.
+//
+// Um registro corrompido no banco nao aborta a busca. Abortar deixava uma
+// unica linha podre bloquear a identificacao de todos os beneficiarios da
+// lista — e justamente as linhas corrompidas sao as que ninguem sabe que
+// existem ate alguem tentar usa-las.
+func (n *nbio) identifica(lida string, candidatos []candidatoJSON) (string, []string, error) {
 	limpa := normalizaTemplate(lida)
 	if limpa == "" {
-		return "", errors.New("template lido invalido")
+		return "", nil, errors.New("template lido invalido")
 	}
 	inLida := novaInputFIRNativa(limpa)
 	defer nativoLibera(inLida)
 	saida := nativoAloca(4)
 	defer nativoLibera(saida)
 	if inLida == 0 || saida == 0 {
-		return "", errors.New("sem memoria nativa")
+		return "", nil, errors.New("sem memoria nativa")
 	}
+	var ignorados []string
 	for _, candidato := range candidatos {
 		limpo := normalizaTemplate(candidato.Template)
 		if limpo == "" {
-			return "", fmt.Errorf("template invalido para candidato %q", candidato.ID)
+			registraErro("identificacao: candidato %q tem template ilegivel, ignorado", candidato.ID)
+			ignorados = append(ignorados, candidato.ID)
+			continue
 		}
 		inCandidato := novaInputFIRNativa(limpo)
 		if inCandidato == 0 {
-			return "", errors.New("sem memoria nativa")
+			return "", ignorados, errors.New("sem memoria nativa")
 		}
 		// NBioAPI_BOOL pode ocupar menos de 4 bytes: zera antes de cada
 		// comparacao para nao herdar o resultado da anterior.
 		if err := escreveUint32Nativo(saida, 0); err != nil {
 			nativoLibera(inCandidato)
-			return "", err
+			return "", ignorados, err
 		}
 		r, _, _ := n.verify.Call(n.h, inLida, inCandidato, saida, 0)
 		nativoLibera(inCandidato)
 		if r != 0 {
-			return "", fmt.Errorf("comparar candidato %q: %w", candidato.ID, novoErroSDK(uint32(r), "NBioAPI_VerifyMatch"))
+			// Checksum e defeito daquele registro, nao da operacao: pula.
+			// Qualquer outro codigo (leitor perdido, handle invalido) e falha
+			// do SDK e continuar so repetiria o erro em cada candidato.
+			if uint32(r) == erroChecksum {
+				registraErro("identificacao: candidato %q com template adulterado (%s), ignorado",
+					candidato.ID, impressaoTemplate(limpo))
+				ignorados = append(ignorados, candidato.ID)
+				continue
+			}
+			return "", ignorados, fmt.Errorf("comparar candidato %q: %w", candidato.ID, novoErroSDK(uint32(r), "NBioAPI_VerifyMatch"))
 		}
 		resultado, err := leUint32Nativo(saida)
 		if err != nil {
-			return "", err
+			return "", ignorados, err
 		}
 		if resultado != 0 {
-			return candidato.ID, nil
+			return candidato.ID, ignorados, nil
 		}
 	}
-	return "", nil
+	return "", ignorados, nil
 }
 
 func cStrLimitada(p uintptr, max int) (string, error) {

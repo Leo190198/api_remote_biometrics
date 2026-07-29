@@ -107,6 +107,43 @@ func TestExigeReinicioSDKAtravessaWrap(t *testing.T) {
 	}
 }
 
+// 0x000B (NBioAPIERROR_INTERNAL_CHECKSUM_FAIL) aparecia como "Erro 0x000B do
+// SDK NBioBSP", que nao dizia a ninguem que o problema era o dado armazenado.
+func TestDescreveErroChecksum(t *testing.T) {
+	got := descreveErro(erroChecksum)
+	if strings.Contains(got, "0x000B") {
+		t.Fatalf("descreveErro(0x000B) = %q; ainda cai no texto generico", got)
+	}
+	if !strings.Contains(got, "checksum") {
+		t.Fatalf("descreveErro(0x000B) = %q; queria explicar o checksum", got)
+	}
+	// Checksum e defeito do dado, nao do leitor: recriar o SDK nao resolve.
+	if exigeReinicioSDK(novoErroSDK(erroChecksum, "NBioAPI_VerifyMatch")) {
+		t.Error("checksum nao deveria disparar recriacao do SDK")
+	}
+}
+
+// A impressao entra no log no lugar do template. Precisa identificar o registro
+// sem carregar o dado biometrico junto.
+func TestImpressaoTemplateNaoVazaOTemplate(t *testing.T) {
+	tmpl := templateDeTeste(2048)
+	imp := impressaoTemplate(tmpl)
+	if strings.Contains(imp, tmpl[:64]) {
+		t.Fatalf("impressao %q contem trecho do template", imp)
+	}
+	if !strings.Contains(imp, "2048 bytes") {
+		t.Fatalf("impressao = %q; queria o tamanho", imp)
+	}
+	if imp != impressaoTemplate(tmpl) {
+		t.Error("impressao nao e estavel para o mesmo template")
+	}
+	// Truncar em um byte tem que mudar a impressao, senao ela nao serve para
+	// flagrar coluna curta no banco.
+	if imp == impressaoTemplate(tmpl[:len(tmpl)-1]) {
+		t.Error("template truncado produziu a mesma impressao")
+	}
+}
+
 func TestDescreveErroCodigoDesconhecido(t *testing.T) {
 	if got := descreveErro(0x0BAD); !strings.Contains(got, "0x0BAD") {
 		t.Fatalf("descreveErro(0x0BAD) = %q; queria o codigo no texto", got)

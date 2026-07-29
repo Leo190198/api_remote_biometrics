@@ -53,6 +53,12 @@ func workerFalso(modo string) int {
 		case opIdentificar:
 			r := respostaWorker{OK: true}
 			for _, c := range p.Candidatos {
+				// "corrompido" imita o candidato que o SDK recusa por
+				// checksum: entra em Ignorados e a busca continua.
+				if c.Template == "corrompido" {
+					r.Ignorados = append(r.Ignorados, c.ID)
+					continue
+				}
 				if c.Template == p.A {
 					r.ID, r.Confere = c.ID, true
 					break
@@ -88,16 +94,37 @@ func TestClienteWorkerRoundTrip(t *testing.T) {
 	if err != nil || !confere {
 		t.Fatalf("comparaTextos = %v, %v; queria true, nil", confere, err)
 	}
-	id, err := c.identifica("tmpl-b", []candidatoJSON{
+	id, ignorados, err := c.identifica("tmpl-b", []candidatoJSON{
 		{ID: "a", Template: "tmpl-a"},
 		{ID: "b", Template: "tmpl-b"},
 	})
-	if err != nil || id != "b" {
-		t.Fatalf("identifica = %q, %v; queria \"b\", nil", id, err)
+	if err != nil || id != "b" || len(ignorados) != 0 {
+		t.Fatalf("identifica = %q, %v, %v; queria \"b\", [], nil", id, ignorados, err)
 	}
 	// O mesmo processo atendeu tudo: nada de subir um worker por chamada.
 	if c.cmd == nil {
 		t.Fatal("worker deveria continuar vivo entre chamadas")
+	}
+}
+
+// Um cadastro corrompido no meio da lista nao pode impedir a identificacao dos
+// demais. Antes, o primeiro registro ruim abortava a busca inteira e uma unica
+// linha podre no banco bloqueava a identificacao de todo mundo.
+func TestIdentificaIgnoraCandidatoCorrompidoESegue(t *testing.T) {
+	c := clienteDeTeste(t, "eco")
+	id, ignorados, err := c.identifica("tmpl-c", []candidatoJSON{
+		{ID: "a", Template: "tmpl-a"},
+		{ID: "podre", Template: "corrompido"},
+		{ID: "c", Template: "tmpl-c"},
+	})
+	if err != nil {
+		t.Fatalf("identifica devolveu erro: %v", err)
+	}
+	if id != "c" {
+		t.Errorf("id = %q; queria \"c\" — o candidato corrompido interrompeu a busca", id)
+	}
+	if len(ignorados) != 1 || ignorados[0] != "podre" {
+		t.Errorf("ignorados = %v; queria [podre]", ignorados)
 	}
 }
 
