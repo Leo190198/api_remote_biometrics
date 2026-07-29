@@ -811,6 +811,9 @@ func executa() int {
 		}
 		return 0
 	}
+	if len(os.Args) > 1 && os.Args[1] == "--autoteste" {
+		return rodaAutoteste()
+	}
 	// O worker herda BIO_FILHO do agente, entao precisa ser testado antes.
 	if os.Getenv("BIO_WORKER") == "1" {
 		return workerMain()

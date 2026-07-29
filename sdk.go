@@ -385,6 +385,14 @@ func (n *nbio) comparaTextos(a, b string) (bool, error) {
 	if limpoA == "" || limpoB == "" {
 		return false, errors.New("template invalido")
 	}
+	return n.comparaBrutos(limpoA, limpoB)
+}
+
+// comparaBrutos entrega os dois templates ao SDK exatamente como recebeu, sem
+// normalizar nem validar. E o que o autoteste usa para responder a pergunta que
+// nenhum outro caminho responde: o defeito esta no tratamento que damos ao
+// template, ou na forma como montamos a chamada para a DLL?
+func (n *nbio) comparaBrutos(limpoA, limpoB string) (bool, error) {
 	inA := novaInputFIRNativa(limpoA)
 	defer nativoLibera(inA)
 	inB := novaInputFIRNativa(limpoB)
