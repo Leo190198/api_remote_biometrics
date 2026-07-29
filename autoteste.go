@@ -7,17 +7,18 @@ package main
 //
 //	AgenteBiometria.exe --autoteste
 //
-// Existe porque VerifyMatch estava devolvendo 0x000B (checksum) mesmo com os
-// dois templates recem-capturados e comparados em memoria, sem passar por banco
-// nenhum. Nesse ponto sobram duas explicacoes possiveis, e elas exigem
-// correcoes opostas:
+// Existe porque VerifyMatch devolvia 0x000B (checksum) com dois templates
+// recem-capturados comparados em memoria, sem passar por banco nenhum.
 //
-//  1. o template e alterado no caminho ate a DLL (normalizacao, transporte);
-//  2. a chamada a DLL esta montada errada (layout do INPUT_FIR, argumentos).
+// A fase 1 fala com a DLL no proprio processo e compara um template com ele
+// mesmo, byte a byte como saiu do SDK: responde se a chamada a DLL esta montada
+// certa e se a normalizacao preserva o template. A fase 2 repete a comparacao
+// pelo caminho de producao, atravessando o processo worker e o JSON, usando os
+// mesmos templates da fase 1 — se a fase 1 passa e a fase 2 falha, os bytes
+// mudam ao cruzar a fronteira do processo, e nao dentro do SDK.
 //
-// Comparar um template com ele mesmo, cru e no mesmo processo, separa as duas:
-// se nem isso confere, nada foi alterado e o defeito e da chamada. O resultado
-// vai para autoteste.log ao lado dos outros logs, sem nenhum template dentro.
+// O relatorio vai para autoteste.log junto dos outros logs, sem nenhum template
+// dentro: so tamanho, caracteres das pontas e um sha256 curto.
 
 import (
 	"fmt"
@@ -69,6 +70,18 @@ func (a *autoteste) erro(formato string, args ...any) {
 	a.diz("FALHOU: "+formato, args...)
 }
 
+// confirma registra o resultado de uma comparacao que deveria conferir.
+func (a *autoteste) confirma(oque string, confere bool, err error) {
+	switch {
+	case err != nil:
+		a.erro("%s: %v", oque, err)
+	case !confere:
+		a.erro("%s: nao conferiu, e o SDK nao acusou erro", oque)
+	default:
+		a.diz("OK: %s", oque)
+	}
+}
+
 // forma descreve o template sem expor o dado biometrico. O que interessa aqui
 // e o contorno: tamanho, se sobrou espaco nas bordas e quais sao os caracteres
 // extremos - e por ali que truncamento e sujeira aparecem.
@@ -105,108 +118,151 @@ func rodaAutoteste() int {
 		defer procCoUninitialize.Call()
 	}
 
+	cadastro, verificacao, ok := a.faseDireta(dll)
+	if !ok {
+		return a.encerra()
+	}
+	a.faseWorker(dll, cadastro, verificacao)
+	return a.encerra()
+}
+
+// faseDireta fala com a DLL no proprio processo, sem worker e sem JSON.
+func (a *autoteste) faseDireta(dll string) (cadastro, verificacao string, ok bool) {
+	a.diz("")
+	a.diz("=== fase 1: DLL no proprio processo ===")
+
 	sdk, err := novoSDK(dll)
 	if err != nil {
 		a.erro("abrir o SDK: %v", err)
-		return a.encerra()
+		return "", "", false
 	}
+	// Fecha antes da fase 2 para as duas instancias do SDK nao disputarem o
+	// leitor.
 	defer func() { _ = sdk.encerra() }()
 
 	n, err := sdk.contaDispositivos()
 	if err != nil {
 		a.erro("contar dispositivos: %v", err)
-		return a.encerra()
+		return "", "", false
 	}
 	a.diz("leitores encontrados: %d", n)
 	if n == 0 {
 		a.erro("nenhum leitor conectado; o resto do teste precisa de hardware")
-		return a.encerra()
+		return "", "", false
 	}
 
 	a.diz("")
-	a.diz(">>> Encoste o dedo no leitor (captura 1 de 2)")
-	primeiro, err := sdk.capturaTexto(purposeEnroll, 30000)
+	a.diz(">>> Encoste o dedo no leitor (captura 1 de 3)")
+	cadastro, err = sdk.capturaTexto(purposeEnroll, 30000)
 	if err != nil {
 		a.erro("captura 1: %v", err)
-		return a.encerra()
+		return "", "", false
 	}
-	a.diz("%s", forma("captura 1", primeiro))
+	a.diz("%s", forma("captura 1 (cadastro)", cadastro))
 
-	// O teste decisivo. Um template comparado consigo mesmo, byte a byte como
-	// saiu da DLL, tem que conferir. Se falhar por checksum aqui, nenhuma
-	// normalizacao nem transporte esteve envolvido: o defeito esta em como
-	// montamos a chamada, e nao no dado.
+	// O teste decisivo da fase 1. Um template comparado consigo mesmo, byte a
+	// byte como saiu da DLL, tem que conferir. Se falhar por checksum aqui,
+	// nenhuma normalizacao nem transporte esteve envolvido: o defeito esta em
+	// como montamos a chamada.
 	a.diz("")
-	confere, err := sdk.comparaBrutos(primeiro, primeiro)
-	switch {
-	case err != nil:
-		a.erro("comparar a captura 1 com ela mesma (bytes crus): %v", err)
-		a.diz("  => o template nao foi alterado por nada nosso, logo o problema")
-		a.diz("     esta na montagem da chamada ao SDK, nao no dado.")
-	case !confere:
-		a.erro("a captura 1 nao confere com ela mesma, e o SDK nao acusou erro")
-	default:
-		a.diz("OK: captura 1 confere com ela mesma (bytes crus)")
-	}
+	confere, err := sdk.comparaBrutos(cadastro, cadastro)
+	a.confirma("captura 1 confere com ela mesma (bytes crus)", confere, err)
 
-	// Mesmo par, agora pelo caminho normal. Se este falhar e o de cima passar,
-	// a normalizacao e a culpada.
-	limpo := normalizaTemplate(primeiro)
-	if limpo == "" {
+	// Mesmo par pelo caminho normalizado. Se este falhar e o de cima passar, a
+	// normalizacao e a culpada.
+	if limpo := normalizaTemplate(cadastro); limpo == "" {
 		a.erro("normalizaTemplate rejeitou um template recem-capturado pelo proprio SDK")
 	} else {
-		if limpo != primeiro {
-			a.diz("ATENCAO: a normalizacao alterou o template (%d -> %d bytes)", len(primeiro), len(limpo))
+		if limpo != cadastro {
+			a.diz("ATENCAO: a normalizacao alterou o template (%d -> %d bytes)", len(cadastro), len(limpo))
 		}
-		confere, err = sdk.comparaTextos(primeiro, primeiro)
-		switch {
-		case err != nil:
-			a.erro("comparar a captura 1 com ela mesma (normalizado): %v", err)
-			a.diz("  => como o teste com bytes crus passou, a normalizacao e a causa.")
-		case !confere:
-			a.erro("captura 1 nao confere com ela mesma pelo caminho normalizado")
-		default:
-			a.diz("OK: captura 1 confere com ela mesma (normalizado)")
-		}
+		confere, err = sdk.comparaTextos(cadastro, cadastro)
+		a.confirma("captura 1 confere com ela mesma (normalizado)", confere, err)
 	}
 
 	a.diz("")
-	a.diz(">>> Encoste o MESMO dedo no leitor (captura 2 de 2)")
-	segundo, err := sdk.capturaTexto(purposeVerify, 30000)
+	a.diz(">>> Encoste o MESMO dedo no leitor (captura 2 de 3)")
+	verificacao, err = sdk.capturaTexto(purposeVerify, 30000)
 	if err != nil {
 		a.erro("captura 2: %v", err)
-		return a.encerra()
+		return "", "", false
 	}
-	a.diz("%s", forma("captura 2", segundo))
+	a.diz("%s", forma("captura 2 (verificacao)", verificacao))
 
-	// A captura 1 foi feita com purpose de cadastro e a 2 com purpose de
-	// verificacao, que e exatamente o par que /comparar usa em producao. Se so
-	// uma das duas falhar consigo mesma, o purpose e a variavel que importa.
+	// A captura 1 usou purpose de cadastro e a 2 de verificacao: e exatamente o
+	// par que /comparar usa em producao. Se so uma das duas falhar consigo
+	// mesma, o purpose e a variavel que importa.
 	a.diz("")
-	confere, err = sdk.comparaBrutos(segundo, segundo)
-	switch {
-	case err != nil:
-		a.erro("comparar a captura 2 com ela mesma (bytes crus): %v", err)
-	case !confere:
-		a.erro("a captura 2 nao confere com ela mesma, e o SDK nao acusou erro")
-	default:
-		a.diz("OK: captura 2 confere com ela mesma (bytes crus)")
-	}
+	confere, err = sdk.comparaBrutos(verificacao, verificacao)
+	a.confirma("captura 2 confere com ela mesma (bytes crus)", confere, err)
 
-	a.diz("")
-	confere, err = sdk.comparaTextos(primeiro, segundo)
+	confere, err = sdk.comparaTextos(cadastro, verificacao)
 	switch {
 	case err != nil:
 		a.erro("comparar captura 1 com captura 2: %v", err)
 	case confere:
-		a.diz("OK: as duas capturas do mesmo dedo conferem - o caminho esta sadio")
+		a.diz("OK: cadastro x verificacao conferem no processo direto")
 	default:
-		a.diz("as duas capturas nao conferem (sem erro do SDK)")
-		a.diz("  => se foi mesmo o mesmo dedo, e questao de qualidade da leitura,")
-		a.diz("     nao de defeito no codigo.")
+		a.diz("cadastro x verificacao nao conferem (sem erro do SDK)")
+		a.diz("  => se foi mesmo o mesmo dedo, e qualidade de leitura, nao defeito de codigo.")
+	}
+	return cadastro, verificacao, true
+}
+
+// faseWorker repete a comparacao pelo caminho de producao: os templates
+// atravessam o processo worker como JSON antes de chegar na DLL. Reaproveita os
+// templates da fase 1 de proposito — bytes identicos, unica variavel nova e a
+// fronteira do processo.
+func (a *autoteste) faseWorker(dll, cadastro, verificacao string) {
+	a.diz("")
+	a.diz("=== fase 2: caminho de producao (processo worker + JSON) ===")
+
+	cliente, err := novoClienteWorker(dll)
+	if err != nil {
+		a.erro("subir o worker: %v", err)
+		return
+	}
+	defer func() { _ = cliente.encerra() }()
+
+	confere, err := cliente.comparaTextos(cadastro, cadastro)
+	a.confirma("captura 1 confere com ela mesma atravessando o worker", confere, err)
+
+	confere, err = cliente.comparaTextos(cadastro, verificacao)
+	switch {
+	case err != nil:
+		a.erro("cadastro x verificacao pelo worker: %v", err)
+		a.diz("  => a fase 1 comparou estes mesmos bytes sem erro, entao o")
+		a.diz("     problema esta na travessia do processo, nao no SDK.")
+	case confere:
+		a.diz("OK: cadastro x verificacao conferem pelo worker")
+	default:
+		a.diz("cadastro x verificacao nao conferem pelo worker (sem erro do SDK)")
 	}
 
-	return a.encerra()
+	// Ate aqui os templates nasceram no processo direto. Falta o caminho de
+	// volta: um template capturado dentro do worker e devolvido por JSON e o que
+	// o navegador realmente recebe.
+	a.diz("")
+	a.diz(">>> Encoste o MESMO dedo no leitor (captura 3 de 3)")
+	peloWorker, err := cliente.capturaTexto(purposeVerify, 30000)
+	if err != nil {
+		a.erro("captura 3 (via worker): %v", err)
+		return
+	}
+	a.diz("%s", forma("captura 3 (via worker)", peloWorker))
+
+	confere, err = cliente.comparaTextos(peloWorker, peloWorker)
+	a.confirma("captura 3 confere com ela mesma (ida e volta pelo worker)", confere, err)
+
+	confere, err = cliente.comparaTextos(cadastro, peloWorker)
+	switch {
+	case err != nil:
+		a.erro("cadastro x captura 3 pelo worker: %v", err)
+	case confere:
+		a.diz("OK: cadastro x captura 3 conferem - o caminho de producao esta sadio")
+	default:
+		a.diz("cadastro x captura 3 nao conferem (sem erro do SDK)")
+	}
 }
 
 func (a *autoteste) encerra() int {

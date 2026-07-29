@@ -370,6 +370,7 @@ func capturaEResponde(w http.ResponseWriter, r *http.Request, purpose uint16, ti
 		escreveErro(w, http.StatusUnprocessableEntity, err.Error())
 		return
 	}
+	registraInfo("captura: devolveu purpose=%d [%s]", purpose, impressaoTemplate(template))
 	escreveJSON(w, http.StatusOK, template)
 }
 
@@ -415,6 +416,12 @@ func handleComparar(w http.ResponseWriter, r *http.Request) {
 		escreveErro(w, http.StatusBadRequest, "BiometriaLida nao e um template valido")
 		return
 	}
+	// A impressao aqui e no worker permitem seguir o template pelo caminho todo
+	// e achar em que ponto os bytes deixam de ser os que o SDK gerou. Comparar
+	// com a impressao registrada na captura diz se a alteracao veio do sistema
+	// web. Nao carrega dado biometrico: so tamanho e um sha256 curto.
+	registraInfo("comparacao: recebeu benef=[%s] lida=[%s]",
+		impressaoTemplate(body.BiometriaBenef), impressaoTemplate(body.BiometriaLida))
 	ctx, cancel := context.WithTimeout(r.Context(), 45*time.Second)
 	defer cancel()
 	ok, err := naThreadSDK(ctx, func() (bool, error) {

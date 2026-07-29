@@ -145,6 +145,10 @@ func executaOperacao(sdk *nbio, pedido pedidoWorker) (respostaWorker, error) {
 		texto, err := sdk.capturaTexto(pedido.Purpose, pedido.Timeout)
 		return respostaWorker{Texto: texto}, err
 	case opComparar:
+		// Par com a impressao registrada em agente.log: se as duas nao baterem,
+		// os bytes mudaram ao atravessar o processo, e nao dentro do SDK.
+		registraInfo("comparar: recebeu a=[%s] b=[%s]",
+			impressaoTemplate(pedido.A), impressaoTemplate(pedido.B))
 		confere, err := sdk.comparaTextos(pedido.A, pedido.B)
 		return respostaWorker{Confere: confere}, err
 	case opIdentificar:

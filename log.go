@@ -32,3 +32,7 @@ func iniciaLogArquivo(nome string) {
 func registraErro(formato string, args ...any) {
 	logger.Printf("ERRO: "+formato, args...)
 }
+
+func registraInfo(formato string, args ...any) {
+	logger.Printf(formato, args...)
+}
