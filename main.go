@@ -21,6 +21,7 @@ import (
 	"runtime/debug"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"fyne.io/systray"
@@ -33,30 +34,55 @@ var iconeVerde []byte
 var iconeVermelho []byte
 
 const (
-	maxCorpoComparar    = 2 << 20
+	// O corpo de /captura leva dois templates: 256 KB ja e folgado. Manter os
+	// 2 MB antigos so aumentava o pico de memoria do decodificador JSON, que
+	// neste binario 386 divide um espaco de enderecamento de ~2 GB.
+	maxCorpoComparar    = 256 << 10
 	maxCorpoIdentificar = 16 << 20
-	maxTemplate         = 1 << 20
-	maxCandidatos       = 5000
-	maxRequisicoes      = 32
+	// Um FIR texto do NBioBSP tem alguns KB. O limite antigo de 1 MB era ~500x
+	// maior que o real e nao protegia contra nada.
+	maxTemplate       = 64 << 10
+	minTemplate       = 32
+	maxCandidatos     = 5000
+	maxRequisicoes    = 32
+	maxIdentificacoes = 2
 )
 
 var (
 	versao = "0.0.0-dev"
 	commit = "local"
 
-	porta   int
-	token   string
+	porta  int
+	token  string
+	usaTLS bool
+
+	dllMu   sync.RWMutex
 	dllPath string
-	usaTLS  bool
 
 	sdkInst    sdkAPI
 	sdkTasks   = make(chan func(), 16)
-	criaSDK    = func(path string) (sdkAPI, error) { return novoSDK(path) }
+	criaSDK    = func(path string) (sdkAPI, error) { return novoClienteWorker(path) }
 	origens    *gerenciadorOrigens
 	ctxApp     context.Context
 	cancelaApp context.CancelFunc
 	limiteHTTP = make(chan struct{}, maxRequisicoes)
+	// /identificar decodifica corpos de ate 16 MB e o pico do encoding/json
+	// chega a varias vezes isso. Com os 32 slots gerais de limiteHTTP, um
+	// punhado de requisicoes simultaneas estourava a memoria do processo.
+	limiteIdentificar = make(chan struct{}, maxIdentificacoes)
 )
+
+func caminhoDLL() string {
+	dllMu.RLock()
+	defer dllMu.RUnlock()
+	return dllPath
+}
+
+func defineDLL(p string) {
+	dllMu.Lock()
+	dllPath = p
+	dllMu.Unlock()
+}
 
 type sdkAPI interface {
 	contaDispositivos() (uint32, error)
@@ -90,6 +116,12 @@ func naThreadSDK[T any](ctx context.Context, fn func() (T, error)) (T, error) {
 			}
 			resultado <- res
 		}()
+		// Quem pediu ja desistiu enquanto a tarefa esperava na fila. Executar
+		// agora acenderia o leitor para ninguem e seguraria a thread do SDK
+		// por mais 15 ou 30 segundos, empurrando todo o resto para o timeout.
+		if res.err = ctx.Err(); res.err != nil {
+			return
+		}
 		res.valor, res.err = fn()
 	}
 	select {
@@ -109,10 +141,17 @@ func ensureSDK() (sdkAPI, error) {
 	if sdkInst != nil {
 		return sdkInst, nil
 	}
-	if dllPath == "" {
+	caminho := caminhoDLL()
+	if caminho == "" {
+		// O driver pode ter sido instalado depois que o agente subiu; sem esta
+		// nova busca so um reinicio manual resolveria.
+		caminho = achaDLL()
+		defineDLL(caminho)
+	}
+	if caminho == "" {
 		return nil, errors.New("NBioBSP.dll nao encontrada")
 	}
-	inst, err := criaSDK(dllPath)
+	inst, err := criaSDK(caminho)
 	if err != nil {
 		return nil, err
 	}
@@ -311,7 +350,10 @@ func capturaEResponde(w http.ResponseWriter, r *http.Request, purpose uint16, ti
 	if !permiteMetodo(w, r, http.MethodPost) {
 		return
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), time.Duration(timeout)*time.Millisecond+5*time.Second)
+	// Precisa ser mais folgado que o prazo do worker (timeout + 15s), senao o
+	// contexto morre primeiro e a captura segue rodando la, segurando a thread
+	// do SDK para uma resposta que ninguem vai mais ler.
+	ctx, cancel := context.WithTimeout(r.Context(), time.Duration(timeout)*time.Millisecond+25*time.Second)
 	defer cancel()
 	template, err := naThreadSDK(ctx, func() (string, error) {
 		s, err := ensureSDK()
@@ -361,11 +403,21 @@ func handleComparar(w http.ResponseWriter, r *http.Request) {
 		escreveErro(w, http.StatusBadRequest, "JSON invalido: "+err.Error())
 		return
 	}
-	if !templateValido(body.BiometriaBenef) || !templateValido(body.BiometriaLida) {
-		escreveErro(w, http.StatusBadRequest, "template invalido")
+	// Normaliza antes de comparar: o valor validado precisa ser exatamente o
+	// que chega na DLL, senao um CRLF vindo do banco passa direto pro parser.
+	body.BiometriaBenef = normalizaTemplate(body.BiometriaBenef)
+	body.BiometriaLida = normalizaTemplate(body.BiometriaLida)
+	if body.BiometriaBenef == "" {
+		escreveErro(w, http.StatusBadRequest, "BiometriaBenef nao e um template valido")
 		return
 	}
-	ok, err := naThreadSDK(r.Context(), func() (bool, error) {
+	if body.BiometriaLida == "" {
+		escreveErro(w, http.StatusBadRequest, "BiometriaLida nao e um template valido")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 45*time.Second)
+	defer cancel()
+	ok, err := naThreadSDK(ctx, func() (bool, error) {
 		s, err := ensureSDK()
 		if err != nil {
 			return false, err
@@ -389,6 +441,21 @@ func handleIdentificar(w http.ResponseWriter, r *http.Request) {
 	if !permiteMetodo(w, r, http.MethodPost) {
 		return
 	}
+	// Reserva a vaga antes de decodificar: o objetivo e limitar quantos corpos
+	// de 16 MB existem na memoria ao mesmo tempo, nao so quantas comparacoes
+	// rodam em paralelo.
+	espera := time.NewTimer(2 * time.Second)
+	defer espera.Stop()
+	select {
+	case limiteIdentificar <- struct{}{}:
+		defer func() { <-limiteIdentificar }()
+	case <-espera.C:
+		escreveErro(w, http.StatusServiceUnavailable, "identificacao ocupada, tente novamente")
+		return
+	case <-r.Context().Done():
+		return
+	}
+
 	var body struct {
 		Lida       string          `json:"lida"`
 		Candidatos []candidatoJSON `json:"candidatos"`
@@ -397,7 +464,8 @@ func handleIdentificar(w http.ResponseWriter, r *http.Request) {
 		escreveErro(w, http.StatusBadRequest, "JSON invalido: "+err.Error())
 		return
 	}
-	if !templateValido(body.Lida) {
+	body.Lida = normalizaTemplate(body.Lida)
+	if body.Lida == "" {
 		escreveErro(w, http.StatusBadRequest, "template lido invalido")
 		return
 	}
@@ -406,18 +474,30 @@ func handleIdentificar(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ids := make(map[string]struct{}, len(body.Candidatos))
-	for _, c := range body.Candidatos {
-		if c.ID == "" || len(c.ID) > 256 || !templateValido(c.Template) {
-			escreveErro(w, http.StatusBadRequest, "candidato invalido")
+	for i := range body.Candidatos {
+		c := &body.Candidatos[i]
+		if c.ID == "" || len(c.ID) > 256 {
+			escreveErro(w, http.StatusBadRequest, fmt.Sprintf("candidato invalido na posicao %d", i))
+			return
+		}
+		// Apontar qual registro esta corrompido importa: sem isso, achar a
+		// linha ruim no meio de milhares de candidatos vira tentativa e erro.
+		c.Template = normalizaTemplate(c.Template)
+		if c.Template == "" {
+			registraErro("identificacao: template invalido no candidato %q (posicao %d)", c.ID, i)
+			escreveErro(w, http.StatusBadRequest,
+				fmt.Sprintf("template invalido no candidato %q (posicao %d)", c.ID, i))
 			return
 		}
 		if _, duplicado := ids[c.ID]; duplicado {
-			escreveErro(w, http.StatusBadRequest, "id de candidato duplicado")
+			escreveErro(w, http.StatusBadRequest, "id de candidato duplicado: "+c.ID)
 			return
 		}
 		ids[c.ID] = struct{}{}
 	}
-	id, err := naThreadSDK(r.Context(), func() (string, error) {
+	ctx, cancel := context.WithTimeout(r.Context(), 4*time.Minute)
+	defer cancel()
+	id, err := naThreadSDK(ctx, func() (string, error) {
 		s, err := ensureSDK()
 		if err != nil {
 			return "", err
@@ -462,10 +542,10 @@ func geraToken() (string, error) {
 }
 
 func dllOuNada() string {
-	if dllPath == "" {
-		return "NAO ENCONTRADA"
+	if caminho := caminhoDLL(); caminho != "" {
+		return caminho
 	}
-	return dllPath
+	return "NAO ENCONTRADA"
 }
 
 func escreveConfig() error {
@@ -521,34 +601,61 @@ func gerenciaMenuOrigens(ctx context.Context, pai, revogar *systray.MenuItem) {
 		origem string
 		ok     bool
 	}
+	// systray nao fecha ClickedCh quando o item some do menu, entao cada
+	// pendencia ganha um canal proprio para a goroutine de escuta terminar
+	// junto com o item em vez de ficar bloqueada ate o fim do processo.
+	type pendencia struct {
+		item     *systray.MenuItem
+		cancelar chan struct{}
+	}
 	decisoes := make(chan aprovacao, maxOrigensPendentes)
-	itens := make(map[string]*systray.MenuItem)
+	itens := make(map[string]*pendencia)
+	remove := func(origem string) {
+		p, existe := itens[origem]
+		if !existe {
+			return
+		}
+		delete(itens, origem)
+		close(p.cancelar)
+		p.item.Remove()
+	}
+	defer func() {
+		for origem := range itens {
+			remove(origem)
+		}
+	}()
 	for {
 		select {
 		case origem := <-origens.novas:
 			if _, existe := itens[origem]; existe {
 				continue
 			}
-			item := pai.AddSubMenuItem(tituloOrigem(origem), "Autorizar esta origem web")
-			itens[origem] = item
+			p := &pendencia{
+				item:     pai.AddSubMenuItem(tituloOrigem(origem), "Autorizar esta origem web"),
+				cancelar: make(chan struct{}),
+			}
+			itens[origem] = p
 			pai.Enable()
 			systray.SetTooltip("Biometria: autorizacao pendente para " + tituloOrigem(origem))
-			go func(origem string, item *systray.MenuItem) {
-				_, ok := <-item.ClickedCh
-				decisoes <- aprovacao{origem: origem, ok: ok}
-			}(origem, item)
+			go func(origem string, p *pendencia) {
+				select {
+				case _, ok := <-p.item.ClickedCh:
+					select {
+					case decisoes <- aprovacao{origem: origem, ok: ok}:
+					case <-ctx.Done():
+					}
+				case <-p.cancelar:
+				case <-ctx.Done():
+				}
+			}(origem, p)
 		case decisao := <-decisoes:
-			item := itens[decisao.origem]
-			delete(itens, decisao.origem)
+			remove(decisao.origem)
 			if decisao.ok {
 				if err := origens.aprova(decisao.origem); err != nil {
 					registraErro("salvar origem autorizada: %v", err)
 				} else {
 					logger.Printf("origem autorizada: %s", decisao.origem)
 				}
-			}
-			if item != nil {
-				item.Remove()
 			}
 			if len(itens) == 0 {
 				pai.Disable()
@@ -562,9 +669,8 @@ func gerenciaMenuOrigens(ctx context.Context, pai, revogar *systray.MenuItem) {
 			} else {
 				logger.Printf("origens autorizadas foram revogadas")
 			}
-			for origem, item := range itens {
-				item.Remove()
-				delete(itens, origem)
+			for origem := range itens {
+				remove(origem)
 			}
 			pai.Disable()
 		case <-ctx.Done():
@@ -625,7 +731,11 @@ func onReady() {
 }
 
 func monitorLeitor(ctx context.Context) {
-	ticker := time.NewTicker(5 * time.Second)
+	// NBioAPI_EnumerateDevice devolve uma lista que o SDK aloca e nao expoe
+	// funcao para liberar. A cada 5 segundos eram ~17 mil chamadas por dia,
+	// suficiente para um vazamento pequeno virar falta de memoria num processo
+	// de 32 bits. 15 segundos ainda detecta o leitor rapido o bastante.
+	ticker := time.NewTicker(15 * time.Second)
 	defer ticker.Stop()
 	for {
 		conectado, err := naThreadSDK(ctx, func() (bool, error) {
@@ -673,6 +783,10 @@ func executa() int {
 		}
 		return 0
 	}
+	// O worker herda BIO_FILHO do agente, entao precisa ser testado antes.
+	if os.Getenv("BIO_WORKER") == "1" {
+		return workerMain()
+	}
 	if os.Getenv("BIO_FILHO") != "1" {
 		if !instanciaUnica() {
 			return 0
@@ -686,7 +800,7 @@ func executa() int {
 	ctxApp, cancelaApp = context.WithCancel(context.Background())
 	defer cancelaApp()
 	origens = novoGerenciadorOrigens()
-	dllPath = achaDLL()
+	defineDLL(achaDLL())
 
 	listener, p, err := escolheListener()
 	if err != nil {
@@ -723,10 +837,12 @@ func executa() int {
 		Handler:           middleware(mux, origens),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       20 * time.Second,
-		WriteTimeout:      2 * time.Minute,
-		IdleTimeout:       60 * time.Second,
-		MaxHeaderBytes:    32 << 10,
-		BaseContext:       func(net.Listener) context.Context { return ctxApp },
+		// Precisa ser maior que o contexto de /identificar (4 min), senao uma
+		// busca legitima em milhares de candidatos e cortada na escrita.
+		WriteTimeout:   5 * time.Minute,
+		IdleTimeout:    60 * time.Second,
+		MaxHeaderBytes: 32 << 10,
+		BaseContext:    func(net.Listener) context.Context { return ctxApp },
 	}
 	erroServidor := make(chan error, 1)
 	go func() {

@@ -11,12 +11,14 @@ import (
 
 var logger = log.New(io.Discard, "", log.Ldate|log.Ltime|log.Lmicroseconds)
 
-func iniciaLog() {
+func iniciaLog() { iniciaLogArquivo("agente.log") }
+
+func iniciaLogArquivo(nome string) {
 	dir, err := garanteDiretorioDados()
 	if err != nil {
 		return
 	}
-	path := filepath.Join(dir, "agente.log")
+	path := filepath.Join(dir, nome)
 	if info, err := os.Stat(path); err == nil && info.Size() > 5<<20 {
 		_ = os.Remove(path + ".1")
 		_ = os.Rename(path, path+".1")

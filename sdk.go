@@ -10,7 +10,6 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
-	"unsafe"
 
 	"golang.org/x/sys/windows"
 )
@@ -47,10 +46,55 @@ func descreveErro(c uint32) string {
 	return fmt.Sprintf("Erro 0x%04X do SDK NBioBSP", c)
 }
 
-type firTextEncode struct {
-	IsWideChar int32
-	TextFIR    uintptr
+// erroSDK guarda o codigo devolvido pela DLL, e nao so o texto. Alguns codigos
+// (leitor perdido, falha ao inicializar) deixam a instancia inutilizavel ate um
+// Terminate/Init, e quem trata o erro precisa distinguir esses de um erro
+// rotineiro como "tempo esgotado na captura".
+type erroSDK struct {
+	codigo uint32
+	origem string
 }
+
+func novoErroSDK(codigo uint32, origem string) *erroSDK {
+	return &erroSDK{codigo: codigo, origem: origem}
+}
+
+func (e *erroSDK) Error() string {
+	if e.origem == "" {
+		return descreveErro(e.codigo)
+	}
+	return e.origem + ": " + descreveErro(e.codigo)
+}
+
+func (e *erroSDK) exigeReinicio() bool {
+	switch e.codigo {
+	case 0x0001, 0x0101, 0x010A, 0x010B:
+		return true
+	}
+	return false
+}
+
+// exigeReinicioSDK responde se vale a pena descartar a instancia do SDK e
+// recria-la. Sem isso o agente devolve erro para sempre depois que o usuario
+// desconecta e reconecta o leitor, ou depois de reconectar a sessao RDP.
+func exigeReinicioSDK(err error) bool {
+	var e *erroSDK
+	return errors.As(err, &e) && e.exigeReinicio()
+}
+
+// Layout de NBioAPI_INPUT_FIR e NBioAPI_FIR_TEXTENCODE em 32 bits, como
+// montados por novaInputFIRNativa:
+//
+//	 0..3   Form (formTextEncode)
+//	 4..7   ponteiro para o TEXTENCODE logo abaixo (base+8)
+//	 8..11  IsWideChar
+//	12..15  ponteiro para o texto logo abaixo (base+16)
+//	16..    texto do template terminado em NUL
+const (
+	tamTextEncode       = 8
+	offsetTextEncodePtr = 4
+	cabecalhoInputFIR   = 16
+)
 
 func achaDLL() string {
 	exe, _ := os.Executable()
@@ -106,11 +150,19 @@ func novoSDK(dllPath string) (*nbio, error) {
 			return nil, fmt.Errorf("simbolo %s ausente: %w", nome, err)
 		}
 	}
-	var h uintptr
-	if r, _, _ := n.init.Call(uintptr(unsafe.Pointer(&h))); r != 0 {
-		return nil, errors.New("NBioAPI_Init: " + descreveErro(uint32(r)))
+	saida := nativoAloca(4)
+	if saida == 0 {
+		return nil, errors.New("sem memoria nativa")
 	}
-	n.h = h
+	defer nativoLibera(saida)
+	if r, _, _ := n.init.Call(saida); r != 0 {
+		return nil, novoErroSDK(uint32(r), "NBioAPI_Init")
+	}
+	h, err := leUint32Nativo(saida)
+	if err != nil {
+		return nil, err
+	}
+	n.h = uintptr(h)
 	return n, nil
 }
 
@@ -121,7 +173,7 @@ func (n *nbio) encerra() error {
 	r, _, _ := n.term.Call(n.h)
 	n.h = 0
 	if r != 0 {
-		return errors.New("NBioAPI_Terminate: " + descreveErro(uint32(r)))
+		return novoErroSDK(uint32(r), "NBioAPI_Terminate")
 	}
 	return nil
 }
@@ -129,7 +181,7 @@ func (n *nbio) encerra() error {
 func (n *nbio) abre() error {
 	r, _, _ := n.open.Call(n.h, uintptr(deviceIDAuto))
 	if r != 0 && r != 0x0104 {
-		return errors.New(descreveErro(uint32(r)))
+		return novoErroSDK(uint32(r), "NBioAPI_OpenDevice")
 	}
 	return nil
 }
@@ -137,46 +189,77 @@ func (n *nbio) abre() error {
 func (n *nbio) fecha() error {
 	r, _, _ := n.closeD.Call(n.h, uintptr(deviceIDAuto))
 	if r != 0 && r != 0x0105 {
-		return errors.New(descreveErro(uint32(r)))
+		return novoErroSDK(uint32(r), "NBioAPI_CloseDevice")
 	}
 	return nil
 }
 
 func (n *nbio) contaDispositivos() (uint32, error) {
-	var count uint32
-	var ids uintptr
-	r, _, _ := n.enum.Call(n.h, uintptr(unsafe.Pointer(&count)), uintptr(unsafe.Pointer(&ids)))
-	if r != 0 {
-		return 0, errors.New(descreveErro(uint32(r)))
+	// 4 bytes para a quantidade + 4 para o ponteiro da lista (que nao usamos).
+	saida := nativoAloca(8)
+	if saida == 0 {
+		return 0, errors.New("sem memoria nativa")
 	}
-	return count, nil
+	defer nativoLibera(saida)
+	r, _, _ := n.enum.Call(n.h, saida, saida+4)
+	if r != 0 {
+		return 0, novoErroSDK(uint32(r), "NBioAPI_EnumerateDevice")
+	}
+	return leUint32Nativo(saida)
 }
 
-func (n *nbio) capturaTexto(purpose uint16, timeoutMs int32) (texto string, err error) {
-	if err = n.abre(); err != nil {
+func (n *nbio) capturaTexto(purpose uint16, timeoutMs int32) (string, error) {
+	if err := n.abre(); err != nil {
 		return "", err
 	}
 	defer func() {
-		if fecharErr := n.fecha(); err == nil && fecharErr != nil {
-			err = fecharErr
+		// Falhar ao fechar (leitor removido, redirecionamento RDP oscilando)
+		// nao invalida uma captura que ja terminou: registra e segue, senao um
+		// template bom vira erro e o usuario tem que encostar o dedo de novo.
+		if err := n.fecha(); err != nil {
+			registraErro("fechar leitor apos captura: %v", err)
 		}
 	}()
 
-	var hFIR uintptr
-	r, _, _ := n.capture.Call(n.h, uintptr(purpose), uintptr(unsafe.Pointer(&hFIR)),
-		uintptr(uint32(timeoutMs)), 0, 0)
-	if r != 0 {
-		return "", errors.New(descreveErro(uint32(r)))
+	saidaFIR := nativoAloca(4)
+	if saidaFIR == 0 {
+		return "", errors.New("sem memoria nativa")
 	}
-	defer n.freeFIR.Call(n.h, hFIR)
+	defer nativoLibera(saidaFIR)
+	r, _, _ := n.capture.Call(n.h, uintptr(purpose), saidaFIR, uintptr(uint32(timeoutMs)), 0, 0)
+	if r != 0 {
+		return "", novoErroSDK(uint32(r), "NBioAPI_Capture")
+	}
+	hFIR, err := leUint32Nativo(saidaFIR)
+	if err != nil {
+		return "", err
+	}
+	if hFIR == 0 {
+		return "", errors.New("NBioAPI_Capture devolveu handle nulo")
+	}
+	defer n.freeFIR.Call(n.h, uintptr(hFIR))
 
-	var te firTextEncode
-	r, _, _ = n.getText.Call(n.h, hFIR, uintptr(unsafe.Pointer(&te)), 0)
-	if r != 0 {
-		return "", errors.New(descreveErro(uint32(r)))
+	texto := nativoAloca(tamTextEncode)
+	if texto == 0 {
+		return "", errors.New("sem memoria nativa")
 	}
-	defer n.freeText.Call(n.h, uintptr(unsafe.Pointer(&te)))
-	return cStrLimitada(te.TextFIR, maxTemplate)
+	defer nativoLibera(texto)
+	r, _, _ = n.getText.Call(n.h, uintptr(hFIR), texto, 0)
+	if r != 0 {
+		return "", novoErroSDK(uint32(r), "NBioAPI_GetTextFIRFromHandle")
+	}
+	ponteiro, err := leUint32Nativo(texto + offsetTextEncodePtr)
+	if err != nil {
+		return "", err
+	}
+	if ponteiro == 0 {
+		return "", errors.New("NBioAPI_GetTextFIRFromHandle devolveu texto nulo")
+	}
+	// So libera quando o SDK realmente entregou um ponteiro: chamar
+	// NBioAPI_FreeTextFIR sobre a struct zerada seria pedir para ele liberar
+	// um endereco que ele nunca alocou.
+	defer n.freeText.Call(n.h, texto)
+	return cStrLimitada(uintptr(ponteiro), maxTemplate)
 }
 
 const memFixaZerada = 0x0040
@@ -195,8 +278,30 @@ func nativoLibera(p uintptr) {
 	}
 }
 
+// leUint32Nativo e escreveUint32Nativo acessam a memoria devolvida por
+// nativoAloca sem converter uintptr de volta para unsafe.Pointer, no mesmo
+// estilo do resto do arquivo.
+func leUint32Nativo(p uintptr) (uint32, error) {
+	var b [4]byte
+	var lidos uintptr
+	if err := windows.ReadProcessMemory(windows.CurrentProcess(), p, &b[0], 4, &lidos); err != nil || lidos != 4 {
+		return 0, errors.New("falha ao ler memoria nativa")
+	}
+	return binary.LittleEndian.Uint32(b[:]), nil
+}
+
+func escreveUint32Nativo(p uintptr, v uint32) error {
+	var b [4]byte
+	binary.LittleEndian.PutUint32(b[:], v)
+	var escritos uintptr
+	if err := windows.WriteProcessMemory(windows.CurrentProcess(), p, &b[0], 4, &escritos); err != nil || escritos != 4 {
+		return errors.New("falha ao escrever memoria nativa")
+	}
+	return nil
+}
+
 func novaInputFIRNativa(s string) uintptr {
-	tamanho := 16 + len(s) + 1
+	tamanho := cabecalhoInputFIR + len(s) + 1
 	p := nativoAloca(tamanho)
 	if p == 0 {
 		return 0
@@ -204,8 +309,8 @@ func novaInputFIRNativa(s string) uintptr {
 	dados := make([]byte, tamanho)
 	dados[0] = formTextEncode
 	binary.LittleEndian.PutUint32(dados[4:8], uint32(p+8))
-	binary.LittleEndian.PutUint32(dados[12:16], uint32(p+16))
-	copy(dados[16:], s)
+	binary.LittleEndian.PutUint32(dados[12:16], uint32(p+cabecalhoInputFIR))
+	copy(dados[cabecalhoInputFIR:], s)
 	var escritos uintptr
 	err := windows.WriteProcessMemory(windows.CurrentProcess(), p, &dados[0], uintptr(tamanho), &escritos)
 	if err != nil || escritos != uintptr(tamanho) {
@@ -215,52 +320,97 @@ func novaInputFIRNativa(s string) uintptr {
 	return p
 }
 
-func templateValido(t string) bool {
+// normalizaTemplate devolve o template pronto para entregar ao SDK, ou "" se
+// ele nao puder ser um FIR texto do NBioBSP.
+//
+// A checagem precisa ser rigorosa: NBioAPI_VerifyMatch confia nos campos de
+// tamanho embutidos no template e le fora da alocacao quando eles nao batem
+// com o conteudo. Uma violacao de acesso dentro da DLL nao vira panic do Go —
+// o Windows derruba o processo e nenhum recover() roda. Um registro truncado
+// por coluna curta demais no banco basta para isso.
+//
+// O corte de espacos tambem importa: um template que voltou do banco com CRLF
+// no fim precisa chegar limpo na DLL, e nao do jeito que veio.
+func normalizaTemplate(t string) string {
 	limpo := strings.TrimSpace(t)
-	return len(limpo) >= 20 && len(t) <= maxTemplate && !strings.ContainsRune(t, '\x00')
+	if len(limpo) < minTemplate || len(limpo) > maxTemplate {
+		return ""
+	}
+	for i := 0; i < len(limpo); i++ {
+		// FIR texto do NBioBSP e ASCII imprimivel continuo. Isso corta NUL,
+		// controle, BOM UTF-8, acentuacao e espaco no meio — tudo sinal de
+		// dado corrompido, e todos capazes de despencar dentro do parser.
+		if c := limpo[i]; c < 0x21 || c > 0x7E {
+			return ""
+		}
+	}
+	return limpo
+}
+
+func templateValido(t string) bool {
+	return normalizaTemplate(t) != ""
 }
 
 func (n *nbio) comparaTextos(a, b string) (bool, error) {
-	if !templateValido(a) || !templateValido(b) {
+	limpoA, limpoB := normalizaTemplate(a), normalizaTemplate(b)
+	if limpoA == "" || limpoB == "" {
 		return false, errors.New("template invalido")
 	}
-	inA := novaInputFIRNativa(a)
-	inB := novaInputFIRNativa(b)
+	inA := novaInputFIRNativa(limpoA)
 	defer nativoLibera(inA)
+	inB := novaInputFIRNativa(limpoB)
 	defer nativoLibera(inB)
-	if inA == 0 || inB == 0 {
+	saida := nativoAloca(4)
+	defer nativoLibera(saida)
+	if inA == 0 || inB == 0 || saida == 0 {
 		return false, errors.New("sem memoria nativa")
 	}
-	var resultado int32
-	r, _, _ := n.verify.Call(n.h, inA, inB, uintptr(unsafe.Pointer(&resultado)), 0)
+	r, _, _ := n.verify.Call(n.h, inA, inB, saida, 0)
 	if r != 0 {
-		return false, errors.New(descreveErro(uint32(r)))
+		return false, novoErroSDK(uint32(r), "NBioAPI_VerifyMatch")
+	}
+	resultado, err := leUint32Nativo(saida)
+	if err != nil {
+		return false, err
 	}
 	return resultado != 0, nil
 }
 
 func (n *nbio) identifica(lida string, candidatos []candidatoJSON) (string, error) {
-	if !templateValido(lida) {
+	limpa := normalizaTemplate(lida)
+	if limpa == "" {
 		return "", errors.New("template lido invalido")
 	}
-	inLida := novaInputFIRNativa(lida)
-	if inLida == 0 {
+	inLida := novaInputFIRNativa(limpa)
+	defer nativoLibera(inLida)
+	saida := nativoAloca(4)
+	defer nativoLibera(saida)
+	if inLida == 0 || saida == 0 {
 		return "", errors.New("sem memoria nativa")
 	}
-	defer nativoLibera(inLida)
 	for _, candidato := range candidatos {
-		if !templateValido(candidato.Template) {
+		limpo := normalizaTemplate(candidato.Template)
+		if limpo == "" {
 			return "", fmt.Errorf("template invalido para candidato %q", candidato.ID)
 		}
-		inCandidato := novaInputFIRNativa(candidato.Template)
+		inCandidato := novaInputFIRNativa(limpo)
 		if inCandidato == 0 {
 			return "", errors.New("sem memoria nativa")
 		}
-		var resultado int32
-		r, _, _ := n.verify.Call(n.h, inLida, inCandidato, uintptr(unsafe.Pointer(&resultado)), 0)
+		// NBioAPI_BOOL pode ocupar menos de 4 bytes: zera antes de cada
+		// comparacao para nao herdar o resultado da anterior.
+		if err := escreveUint32Nativo(saida, 0); err != nil {
+			nativoLibera(inCandidato)
+			return "", err
+		}
+		r, _, _ := n.verify.Call(n.h, inLida, inCandidato, saida, 0)
 		nativoLibera(inCandidato)
 		if r != 0 {
-			return "", fmt.Errorf("comparar candidato %q: %s", candidato.ID, descreveErro(uint32(r)))
+			return "", fmt.Errorf("comparar candidato %q: %w", candidato.ID, novoErroSDK(uint32(r), "NBioAPI_VerifyMatch"))
+		}
+		resultado, err := leUint32Nativo(saida)
+		if err != nil {
+			return "", err
 		}
 		if resultado != 0 {
 			return candidato.ID, nil
