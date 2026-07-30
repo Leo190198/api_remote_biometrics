@@ -1,5 +1,7 @@
 # Artefatos de compilacao e diagnostico
 /AgenteBiometria.exe
+# Nome padrao do "go build" sem -o: vem do modulo (agente-biometria).
+/agente-biometria.exe
 /build-err.txt
 *.log
 
