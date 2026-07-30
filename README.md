@@ -214,11 +214,17 @@ O curinga `*` não é aceito em `CORS_ORIGEM`.
 .
 ├── main.go                 # API HTTP, tray e ciclo de vida
 ├── sdk.go                  # Integração com NBioBSP.dll
+├── worker.go               # Processo isolado que hospeda o SDK
+├── autoteste.go            # Comandos de diagnóstico
+├── versaodll.go            # Versão da DLL e módulos carregados
+├── log.go                  # Registro em arquivo
 ├── session.go              # Isolamento entre sessões Windows/RDP
 ├── origins.go              # Autorização e persistência de origens
 ├── cert.go                 # Certificado local e listener HTTP/HTTPS
 ├── supervisor.go           # Reinício automático do processo filho
 ├── storage.go              # Escrita atômica de dados locais
+├── docs/
+│   └── diagnostico-verifymatch-rdp-2026-07-30.md
 ├── instalador/
 │   └── instalar-servidor.ps1
 ├── integracao/
@@ -229,6 +235,31 @@ O curinga `*` não é aceito em `CORS_ORIGEM`.
 └── tray-vermelho.ico
 ```
 
+## Diagnóstico
+
+O executável aceita comandos que rodam fora do modo normal. Feche o agente antes
+de usá-los: dois processos disputando o mesmo leitor derrubam a captura.
+
+| Comando | O que faz | Precisa de leitor? |
+|---|---|---|
+| `--autoteste` | Exercita o caminho completo: captura, comparação direta e pelo worker. Grava relatório em `%LOCALAPPDATA%\BiometriaAgente\autoteste.log`. | Sim, 3 leituras |
+| `--salvar-template <arquivo>` | Captura uma digital e grava o template em arquivo. | Sim |
+| `--conferir-template <arquivo>` | Compara um template com ele mesmo. | **Não** |
+| `--gerar-cert` | Regenera o certificado local. | Não |
+
+Códigos de saída: `0` passou, `1` o SDK recusou com erro tratado, `2` a DLL
+derrubou o processo — nesse caso o traceback traz o endereço da falha, que se
+compara com as faixas dos módulos listados logo antes.
+
+Os dois comandos de template juntos separam **extrator** de **comparador**:
+leve um template de uma máquina que funciona para a que falha. Se ele passar lá,
+o comparador está bom e o defeito é da captura; se falhar, é o comparador. Sem
+isso os dois sempre falham juntos e nada se distingue.
+
+Toda execução registra qual `NBioBSP.dll` foi aberta, com versão e tamanho, e a
+lista dos módulos nativos carregados no processo. Templates nunca aparecem nos
+logs — só tamanho e um `sha256` curto.
+
 ## Solução de problemas
 
 | Sintoma | Verificação |
@@ -237,6 +268,7 @@ O curinga `*` não é aceito em `CORS_ORIGEM`.
 | Origem não autorizada | Abra o tray e aprove o endereço exibido em **Autorizar acesso**. |
 | Nenhum leitor detectado | Confira cabo, driver, redirecionamento RDP e arquitetura da DLL. |
 | `NBioBSP.dll nao encontrada` | Instale o SDK x86 ou configure `NBIOBSP_DLL`. |
+| `Template adulterado` (`0x000B`) ou queda no `VerifyMatch` | Rode `--conferir-template` com um template sabidamente válido. Se a lista de módulos trouxer `ftapihook32.dll` ou `ftfpstub.dll`, veja [docs/diagnostico-verifymatch-rdp-2026-07-30.md](docs/diagnostico-verifymatch-rdp-2026-07-30.md). |
 | Token expirado | Execute novamente `Biometria.garantirConexao()`. |
 | Navegador bloqueou localhost | Use o sistema em HTTPS e conceda a permissão de rede local. |
 

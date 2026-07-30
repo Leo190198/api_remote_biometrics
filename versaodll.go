@@ -60,9 +60,14 @@ func versaoArquivo(caminho string) string {
 // O endereco base e o que fecha a conta. Quando a DLL derruba o processo, o Go
 // imprime o PC da falha; com a faixa de cada modulo em maos, da para dizer qual
 // deles estourou, em vez de deduzir pelo nome do arquivo.
+// Lista todos os modulos, sem filtro de nome.
+//
+// A primeira versao filtrava por nomes da NITGEN e nao mostrou nada alem da
+// propria NBioBSP - o que parecia conclusivo e nao era: um modulo injetado por
+// terceiros nao casa com nenhum desses nomes e ficava invisivel justamente na
+// pergunta que importava. Numa lista curta como a de um binario Go, filtrar
+// custa mais do que economiza.
 func modulosBiometricos() []string {
-	alvos := []string{"NBIOBSP", "VENUS", "NGSTAR", "HALLEY", "PLUTO", "NFRD", "NFPC", "NURU", "NGSCFP"}
-
 	snap, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPMODULE, uint32(windows.GetCurrentProcessId()))
 	if err != nil {
 		return nil
@@ -78,23 +83,31 @@ func modulosBiometricos() []string {
 	var achados []string
 	for {
 		nome := windows.UTF16ToString(entrada.Module[:])
-		maiusculo := strings.ToUpper(nome)
-		for _, alvo := range alvos {
-			if strings.Contains(maiusculo, alvo) {
-				caminho := windows.UTF16ToString(entrada.ExePath[:])
-				// No Windows o HMODULE de um modulo carregado e o proprio
-				// endereco base, entao nao ha ponteiro para converter aqui.
-				inicio := uintptr(entrada.ModuleHandle)
-				achados = append(achados, fmt.Sprintf("%s base 0x%08x fim 0x%08x  %s",
-					nome, inicio, inicio+uintptr(entrada.ModBaseSize), descreveDLL(caminho)))
-				break
-			}
+		caminho := windows.UTF16ToString(entrada.ExePath[:])
+		// No Windows o HMODULE de um modulo carregado e o proprio endereco
+		// base, entao nao ha ponteiro para converter aqui.
+		inicio := uintptr(entrada.ModuleHandle)
+		fim := inicio + uintptr(entrada.ModBaseSize)
+
+		// Modulo do sistema aparece so com o nome; qualquer outro vem com
+		// caminho e versao, porque e ai que mora o que uma maquina tem e a
+		// outra nao.
+		detalhe := ""
+		if !ehModuloDoSistema(caminho) {
+			detalhe = "  " + descreveDLL(caminho)
 		}
+		achados = append(achados, fmt.Sprintf("%-24s base 0x%08x fim 0x%08x%s", nome, inicio, fim, detalhe))
+
 		if err := windows.Module32Next(snap, &entrada); err != nil {
 			break
 		}
 	}
 	return achados
+}
+
+func ehModuloDoSistema(caminho string) bool {
+	c := strings.ToUpper(caminho)
+	return strings.HasPrefix(c, `C:\WINDOWS\SYSTEM32\`) || strings.HasPrefix(c, `C:\WINDOWS\SYSWOW64\`)
 }
 
 // descreveDLL junta o que distingue uma instalacao da outra: caminho, versao e
