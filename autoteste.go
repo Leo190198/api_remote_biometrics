@@ -25,6 +25,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
 	"strings"
 	"time"
 
@@ -55,14 +56,41 @@ func ligaConsole() {
 }
 
 type autoteste struct {
-	linhas []string
-	falhou bool
+	arquivo *os.File
+	falhou  bool
+}
+
+// abreRelatorio deixa o arquivo pronto antes da primeira chamada ao SDK.
+//
+// O relatorio era montado na memoria e gravado so no fim. Quando a DLL derrubou
+// o processo no meio da fase 1, nao sobrou uma linha sequer para dizer onde
+// parou - justamente na execucao que mais precisava ser lida. Agora cada linha
+// vai para o disco na hora, e a ultima que aparecer no arquivo e o passo que
+// matou o processo.
+func (a *autoteste) abreRelatorio() string {
+	destino := "autoteste.log"
+	if dir, err := garanteDiretorioDados(); err == nil {
+		destino = filepath.Join(dir, "autoteste.log")
+	}
+	f, err := os.OpenFile(destino, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "abrir o relatorio:", err)
+		return ""
+	}
+	a.arquivo = f
+	return destino
 }
 
 func (a *autoteste) diz(formato string, args ...any) {
 	linha := fmt.Sprintf(formato, args...)
-	a.linhas = append(a.linhas, linha)
 	fmt.Println(linha)
+	if a.arquivo == nil {
+		return
+	}
+	// Sync a cada linha porque o proximo passo pode ser o que mata o processo,
+	// e linha presa em buffer nao ajuda ninguem.
+	_, _ = a.arquivo.WriteString(linha + "\r\n")
+	_ = a.arquivo.Sync()
 }
 
 func (a *autoteste) erro(formato string, args ...any) {
@@ -98,12 +126,27 @@ func forma(nome, t string) string {
 		nome, len(t), t[0], t[len(t)-1], borda, impressaoTemplate(t))
 }
 
-func rodaAutoteste() int {
+func rodaAutoteste() (codigo int) {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 	ligaConsole()
 
 	a := &autoteste{}
+	if destino := a.abreRelatorio(); destino != "" {
+		fmt.Println("relatorio em", destino)
+	}
+	// Um panic do Go e recuperavel e precisa entrar no relatorio: e a diferenca
+	// entre "a DLL derrubou o processo" e "nosso codigo errou". Violacao de
+	// acesso dentro da DLL nao passa por aqui - nesse caso quem aponta o culpado
+	// e a ultima linha gravada.
+	defer func() {
+		if p := recover(); p != nil {
+			a.erro("panic do Go: %v", p)
+			a.diz("%s", debug.Stack())
+			codigo = a.encerra()
+		}
+	}()
+
 	a.diz("autoteste do agente de biometria - versao %s commit %s", versao, commit)
 	a.diz("horario: %s", time.Now().Format("2006-01-02 15:04:05"))
 
@@ -112,7 +155,7 @@ func rodaAutoteste() int {
 		a.erro("NBioBSP.dll nao encontrada. Defina NBIOBSP_DLL e tente de novo.")
 		return a.encerra()
 	}
-	a.diz("DLL: %s", dll)
+	a.diz("DLL: %s", descreveDLL(dll))
 
 	if r, _, _ := procCoInitializeEx.Call(0, coinitApartmentThreaded); r == 0 || r == 1 {
 		defer procCoUninitialize.Call()
@@ -131,6 +174,7 @@ func (a *autoteste) faseDireta(dll string) (cadastro, verificacao string, ok boo
 	a.diz("")
 	a.diz("=== fase 1: DLL no proprio processo ===")
 
+	a.diz("passo: carregar a DLL e chamar NBioAPI_Init")
 	sdk, err := novoSDK(dll)
 	if err != nil {
 		a.erro("abrir o SDK: %v", err)
@@ -140,6 +184,7 @@ func (a *autoteste) faseDireta(dll string) (cadastro, verificacao string, ok boo
 	// leitor.
 	defer func() { _ = sdk.encerra() }()
 
+	a.diz("passo: NBioAPI_EnumerateDevice")
 	n, err := sdk.contaDispositivos()
 	if err != nil {
 		a.erro("contar dispositivos: %v", err)
@@ -153,6 +198,7 @@ func (a *autoteste) faseDireta(dll string) (cadastro, verificacao string, ok boo
 
 	a.diz("")
 	a.diz(">>> Encoste o dedo no leitor (captura 1 de 3)")
+	a.diz("passo: NBioAPI_Capture purpose=%d (cadastro)", purposeEnroll)
 	cadastro, err = sdk.capturaTexto(purposeEnroll, 30000)
 	if err != nil {
 		a.erro("captura 1: %v", err)
@@ -165,6 +211,7 @@ func (a *autoteste) faseDireta(dll string) (cadastro, verificacao string, ok boo
 	// nenhuma normalizacao nem transporte esteve envolvido: o defeito esta em
 	// como montamos a chamada.
 	a.diz("")
+	a.diz("passo: NBioAPI_VerifyMatch com a captura 1 contra ela mesma, bytes crus")
 	confere, err := sdk.comparaBrutos(cadastro, cadastro)
 	a.confirma("captura 1 confere com ela mesma (bytes crus)", confere, err)
 
@@ -182,6 +229,7 @@ func (a *autoteste) faseDireta(dll string) (cadastro, verificacao string, ok boo
 
 	a.diz("")
 	a.diz(">>> Encoste o MESMO dedo no leitor (captura 2 de 3)")
+	a.diz("passo: NBioAPI_Capture purpose=%d (verificacao)", purposeVerify)
 	verificacao, err = sdk.capturaTexto(purposeVerify, 30000)
 	if err != nil {
 		a.erro("captura 2: %v", err)
@@ -217,6 +265,7 @@ func (a *autoteste) faseWorker(dll, cadastro, verificacao string) {
 	a.diz("")
 	a.diz("=== fase 2: caminho de producao (processo worker + JSON) ===")
 
+	a.diz("passo: subir o processo worker")
 	cliente, err := novoClienteWorker(dll)
 	if err != nil {
 		a.erro("subir o worker: %v", err)
@@ -273,15 +322,9 @@ func (a *autoteste) encerra() int {
 		a.diz("RESULTADO: tudo passou")
 	}
 
-	destino := "autoteste.log"
-	if dir, err := garanteDiretorioDados(); err == nil {
-		destino = filepath.Join(dir, "autoteste.log")
-	}
-	conteudo := strings.Join(a.linhas, "\r\n") + "\r\n"
-	if err := os.WriteFile(destino, []byte(conteudo), 0o600); err != nil {
-		fmt.Fprintln(os.Stderr, "gravar o relatorio:", err)
-	} else {
-		fmt.Println("relatorio gravado em", destino)
+	if a.arquivo != nil {
+		_ = a.arquivo.Close()
+		a.arquivo = nil
 	}
 	if a.falhou {
 		return 1

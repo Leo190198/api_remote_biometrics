@@ -839,6 +839,9 @@ func executa() int {
 	defer cancelaApp()
 	origens = novoGerenciadorOrigens()
 	defineDLL(achaDLL())
+	// Qual DLL foi escolhida e a primeira pergunta de qualquer diagnostico, e
+	// era a unica que o log nao respondia.
+	registraInfo("DLL: %s", descreveDLL(caminhoDLL()))
 
 	listener, p, err := escolheListener()
 	if err != nil {

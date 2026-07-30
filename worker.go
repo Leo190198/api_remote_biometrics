@@ -77,6 +77,7 @@ func workerMain() int {
 	entrada := json.NewDecoder(bufio.NewReaderSize(os.Stdin, 64<<10))
 	saida := json.NewEncoder(os.Stdout)
 	dll := os.Getenv("BIO_WORKER_DLL")
+	registraInfo("worker: DLL %s", descreveDLL(dll))
 
 	var sdk *nbio
 	defer func() {
