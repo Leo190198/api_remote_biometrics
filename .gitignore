@@ -6,6 +6,9 @@
 *.log
 
 # Dados locais gerados pelo agente
+# Templates biometricos NUNCA entram no repositorio: sao dado pessoal
+# irrevogavel, e este repositorio e publico.
+template*.txt
 cert.pem
 key.pem
 agente-*.json

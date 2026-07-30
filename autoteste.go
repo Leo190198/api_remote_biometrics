@@ -38,6 +38,16 @@ import (
 // nao apareceriam em lugar nenhum. Falhar aqui nao e problema - o relatorio em
 // disco continua sendo gravado.
 func ligaConsole() {
+	// Se a saida ja foi redirecionada, para arquivo ou cano, nao rouba. Quem
+	// redirecionou quer o texto la, e trocar por CONOUT$ faz o resultado sumir
+	// justamente nas execucoes que alguem quis registrar - foi assim que dois
+	// diagnosticos se perderam numa janela de console que fechou.
+	//
+	// Um binario -H windowsgui sem redirecionamento nasce com os handles
+	// padrao nulos, entao handle valido aqui significa redirecionamento.
+	if h, err := windows.GetStdHandle(windows.STD_OUTPUT_HANDLE); err == nil && h != 0 && h != windows.InvalidHandle {
+		return
+	}
 	proc := windows.NewLazySystemDLL("kernel32.dll").NewProc("AttachConsole")
 	const consoleDoPai = ^uintptr(0) // ATTACH_PARENT_PROCESS
 	if r, _, _ := proc.Call(consoleDoPai); r == 0 {
@@ -409,6 +419,9 @@ func confereTemplate(caminho string) int {
 	}
 	defer func() { _ = sdk.encerra() }()
 	fmt.Println("DLL:", descreveDLL(dll))
+	if ids, err := sdk.listaDispositivos(); err == nil && len(ids) > 0 {
+		fmt.Printf("IDs dos leitores: %v\n", ids)
+	}
 	fmt.Println(forma("template lido do arquivo", template))
 
 	confere, err := sdk.comparaBrutos(template, template)
