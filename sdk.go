@@ -228,6 +228,50 @@ func (n *nbio) contaDispositivos() (uint32, error) {
 	return leUint32Nativo(saida)
 }
 
+// listaDispositivos devolve os IDs dos leitores que o SDK enxerga.
+//
+// A contagem sozinha nao distingue um modelo de outro, e "o leitor e o mesmo?"
+// virou a pergunta central: o mesmo codigo com a mesma DLL passa numa maquina e
+// falha em outra, entao o que resta de diferente e o hardware e o caminho ate
+// ele.
+func (n *nbio) listaDispositivos() ([]uint16, error) {
+	saida := nativoAloca(8)
+	if saida == 0 {
+		return nil, errors.New("sem memoria nativa")
+	}
+	defer nativoLibera(saida)
+	r, _, _ := n.enum.Call(n.h, saida, saida+4)
+	if r != 0 {
+		return nil, novoErroSDK(uint32(r), "NBioAPI_EnumerateDevice")
+	}
+	quantidade, err := leUint32Nativo(saida)
+	if err != nil {
+		return nil, err
+	}
+	// Uma quantidade absurda significa que a leitura saiu do lugar certo.
+	// Percorrer memoria a esmo a partir dai so trocaria um diagnostico ruim
+	// por um travamento.
+	if quantidade == 0 || quantidade > 64 {
+		return nil, nil
+	}
+	lista, err := leUint32Nativo(saida + 4)
+	if err != nil {
+		return nil, err
+	}
+	if lista == 0 {
+		return nil, nil
+	}
+	ids := make([]uint16, 0, quantidade)
+	for i := uint32(0); i < quantidade; i++ {
+		v, err := leUint16Nativo(uintptr(lista) + uintptr(i)*2)
+		if err != nil {
+			return ids, err
+		}
+		ids = append(ids, v)
+	}
+	return ids, nil
+}
+
 func (n *nbio) capturaTexto(purpose uint16, timeoutMs int32) (string, error) {
 	if err := n.abre(); err != nil {
 		return "", err
@@ -308,6 +352,15 @@ func leUint32Nativo(p uintptr) (uint32, error) {
 		return 0, errors.New("falha ao ler memoria nativa")
 	}
 	return binary.LittleEndian.Uint32(b[:]), nil
+}
+
+func leUint16Nativo(p uintptr) (uint16, error) {
+	var b [2]byte
+	var lidos uintptr
+	if err := windows.ReadProcessMemory(windows.CurrentProcess(), p, &b[0], 2, &lidos); err != nil || lidos != 2 {
+		return 0, errors.New("falha ao ler memoria nativa")
+	}
+	return binary.LittleEndian.Uint16(b[:]), nil
 }
 
 func escreveUint32Nativo(p uintptr, v uint32) error {

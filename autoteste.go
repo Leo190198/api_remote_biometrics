@@ -21,6 +21,7 @@ package main
 // dentro: so tamanho, caracteres das pontas e um sha256 curto.
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -185,6 +186,9 @@ func (a *autoteste) faseDireta(dll string) (cadastro, verificacao string, ok boo
 	defer func() { _ = sdk.encerra() }()
 
 	a.diz("passo: NBioAPI_EnumerateDevice")
+	if ids, err := sdk.listaDispositivos(); err == nil && len(ids) > 0 {
+		a.diz("IDs dos leitores: %v", ids)
+	}
 	n, err := sdk.contaDispositivos()
 	if err != nil {
 		a.erro("contar dispositivos: %v", err)
@@ -265,6 +269,11 @@ func (a *autoteste) faseWorker(dll, cadastro, verificacao string) {
 	a.diz("")
 	a.diz("=== fase 2: caminho de producao (processo worker + JSON) ===")
 
+	// A conclusao da fase 2 so vale se a fase 1 tiver passado: sem isso o
+	// relatorio acusava a travessia do processo mesmo quando o SDK ja havia
+	// falhado sozinho, e mandava quem le para o lado errado.
+	falhouAntes := a.falhou
+
 	a.diz("passo: subir o processo worker")
 	cliente, err := novoClienteWorker(dll)
 	if err != nil {
@@ -280,8 +289,10 @@ func (a *autoteste) faseWorker(dll, cadastro, verificacao string) {
 	switch {
 	case err != nil:
 		a.erro("cadastro x verificacao pelo worker: %v", err)
-		a.diz("  => a fase 1 comparou estes mesmos bytes sem erro, entao o")
-		a.diz("     problema esta na travessia do processo, nao no SDK.")
+		if !falhouAntes {
+			a.diz("  => a fase 1 comparou estes mesmos bytes sem erro, entao o")
+			a.diz("     problema esta na travessia do processo, nao no SDK.")
+		}
 	case confere:
 		a.diz("OK: cadastro x verificacao conferem pelo worker")
 	default:
@@ -312,6 +323,105 @@ func (a *autoteste) faseWorker(dll, cadastro, verificacao string) {
 	default:
 		a.diz("cadastro x captura 3 nao conferem (sem erro do SDK)")
 	}
+}
+
+// abreSDKDireto prepara o SDK no proprio processo, como a fase 1 faz.
+//
+// Nao chama CoUninitialize: quem usa isto sao comandos de uma tacada so, que
+// terminam o processo logo em seguida.
+func abreSDKDireto() (*nbio, string, error) {
+	dll := achaDLL()
+	if dll == "" {
+		return nil, "", errors.New("NBioBSP.dll nao encontrada")
+	}
+	procCoInitializeEx.Call(0, coinitApartmentThreaded)
+	sdk, err := novoSDK(dll)
+	if err != nil {
+		return nil, dll, err
+	}
+	return sdk, dll, nil
+}
+
+// salvaTemplate captura um template e grava o texto num arquivo, sem comparar
+// nada.
+//
+// Junto com confereTemplate, separa as duas metades do SDK, que ate agora so
+// foram testadas na mesma maquina e por isso sempre falharam ou passaram juntas:
+//
+//   - template gerado na maquina sadia PASSA na doente  -> o comparador de la
+//     esta bom, e quem produz dado ruim e o extrator/leitor.
+//   - template gerado na maquina sadia FALHA na doente  -> o comparador e que
+//     esta quebrado, e o leitor nao tem culpa.
+//
+// E a unica pergunta que sobrou depois que a versao da DLL foi descartada: a
+// mesma DLL, byte a byte, passa numa maquina e falha na outra.
+func salvaTemplate(caminho string) int {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	ligaConsole()
+
+	sdk, dll, err := abreSDKDireto()
+	if err != nil {
+		fmt.Println("erro ao abrir o SDK:", err)
+		return 1
+	}
+	defer func() { _ = sdk.encerra() }()
+	fmt.Println("DLL:", descreveDLL(dll))
+	if ids, err := sdk.listaDispositivos(); err == nil && len(ids) > 0 {
+		fmt.Printf("IDs dos leitores: %v\n", ids)
+	}
+
+	fmt.Println(">>> Encoste o dedo no leitor")
+	template, err := sdk.capturaTexto(purposeEnroll, 30000)
+	if err != nil {
+		fmt.Println("erro na captura:", err)
+		return 1
+	}
+	if err := os.WriteFile(caminho, []byte(template), 0o600); err != nil {
+		fmt.Println("erro ao gravar:", err)
+		return 1
+	}
+	fmt.Println(forma("template salvo", template))
+	fmt.Println("arquivo:", caminho)
+	return 0
+}
+
+// confereTemplate le um template de arquivo e o compara com ele mesmo.
+//
+// Nao encosta no leitor: VerifyMatch nao precisa de dispositivo aberto. Da para
+// rodar numa maquina sem hardware nenhum, e e so o comparador sendo exercitado.
+func confereTemplate(caminho string) int {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	ligaConsole()
+
+	dados, err := os.ReadFile(caminho)
+	if err != nil {
+		fmt.Println("erro ao ler o arquivo:", err)
+		return 1
+	}
+	template := string(dados)
+
+	sdk, dll, err := abreSDKDireto()
+	if err != nil {
+		fmt.Println("erro ao abrir o SDK:", err)
+		return 1
+	}
+	defer func() { _ = sdk.encerra() }()
+	fmt.Println("DLL:", descreveDLL(dll))
+	fmt.Println(forma("template lido do arquivo", template))
+
+	confere, err := sdk.comparaBrutos(template, template)
+	switch {
+	case err != nil:
+		fmt.Println("FALHOU:", err)
+		return 1
+	case !confere:
+		fmt.Println("FALHOU: nao conferiu consigo mesmo, e o SDK nao acusou erro")
+		return 1
+	}
+	fmt.Println("OK: o template confere consigo mesmo nesta maquina")
+	return 0
 }
 
 func (a *autoteste) encerra() int {

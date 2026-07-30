@@ -821,6 +821,12 @@ func executa() int {
 	if len(os.Args) > 1 && os.Args[1] == "--autoteste" {
 		return rodaAutoteste()
 	}
+	if len(os.Args) > 2 && os.Args[1] == "--salvar-template" {
+		return salvaTemplate(os.Args[2])
+	}
+	if len(os.Args) > 2 && os.Args[1] == "--conferir-template" {
+		return confereTemplate(os.Args[2])
+	}
 	// O worker herda BIO_FILHO do agente, entao precisa ser testado antes.
 	if os.Getenv("BIO_WORKER") == "1" {
 		return workerMain()
