@@ -225,6 +225,10 @@ func (a *autoteste) faseDireta(dll string) (cadastro, verificacao string, ok boo
 	// nenhuma normalizacao nem transporte esteve envolvido: o defeito esta em
 	// como montamos a chamada.
 	a.diz("")
+	for _, m := range modulosBiometricos() {
+		a.diz("modulo: %s", m)
+	}
+
 	a.diz("passo: NBioAPI_VerifyMatch com a captura 1 contra ela mesma, bytes crus")
 	confere, err := sdk.comparaBrutos(cadastro, cadastro)
 	a.confirma("captura 1 confere com ela mesma (bytes crus)", confere, err)
@@ -423,6 +427,12 @@ func confereTemplate(caminho string) int {
 		fmt.Printf("IDs dos leitores: %v\n", ids)
 	}
 	fmt.Println(forma("template lido do arquivo", template))
+
+	// Impresso antes da comparacao de proposito: se a DLL derrubar o processo,
+	// esta lista ja esta na saida e o PC da falha cai dentro de uma das faixas.
+	for _, m := range modulosBiometricos() {
+		fmt.Println("modulo:", m)
+	}
 
 	confere, err := sdk.comparaBrutos(template, template)
 	switch {

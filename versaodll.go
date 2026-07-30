@@ -13,6 +13,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"strings"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -45,6 +46,55 @@ func versaoArquivo(caminho string) string {
 	return fmt.Sprintf("%d.%d.%d.%d",
 		fixo.FileVersionMS>>16, fixo.FileVersionMS&0xffff,
 		fixo.FileVersionLS>>16, fixo.FileVersionLS&0xffff)
+}
+
+// modulosBiometricos descreve os modulos do SDK ja carregados neste processo,
+// com endereco base e tamanho.
+//
+// A NBioBSP carrega o motor de comparacao por nome, em tempo de execucao. Ate
+// agora so dava para adivinhar qual entrou, e numa maquina onde convivem o
+// Venus da NITGEN e o NGStar da UnionCommunity a diferenca e o algoritmo
+// inteiro. Comparar arquivos em disco nao responde isso: so a lista do que o
+// processo abriu responde.
+//
+// O endereco base e o que fecha a conta. Quando a DLL derruba o processo, o Go
+// imprime o PC da falha; com a faixa de cada modulo em maos, da para dizer qual
+// deles estourou, em vez de deduzir pelo nome do arquivo.
+func modulosBiometricos() []string {
+	alvos := []string{"NBIOBSP", "VENUS", "NGSTAR", "HALLEY", "PLUTO", "NFRD", "NFPC", "NURU", "NGSCFP"}
+
+	snap, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPMODULE, uint32(windows.GetCurrentProcessId()))
+	if err != nil {
+		return nil
+	}
+	defer func() { _ = windows.CloseHandle(snap) }()
+
+	var entrada windows.ModuleEntry32
+	entrada.Size = uint32(unsafe.Sizeof(entrada))
+	if err := windows.Module32First(snap, &entrada); err != nil {
+		return nil
+	}
+
+	var achados []string
+	for {
+		nome := windows.UTF16ToString(entrada.Module[:])
+		maiusculo := strings.ToUpper(nome)
+		for _, alvo := range alvos {
+			if strings.Contains(maiusculo, alvo) {
+				caminho := windows.UTF16ToString(entrada.ExePath[:])
+				// No Windows o HMODULE de um modulo carregado e o proprio
+				// endereco base, entao nao ha ponteiro para converter aqui.
+				inicio := uintptr(entrada.ModuleHandle)
+				achados = append(achados, fmt.Sprintf("%s base 0x%08x fim 0x%08x  %s",
+					nome, inicio, inicio+uintptr(entrada.ModBaseSize), descreveDLL(caminho)))
+				break
+			}
+		}
+		if err := windows.Module32Next(snap, &entrada); err != nil {
+			break
+		}
+	}
+	return achados
 }
 
 // descreveDLL junta o que distingue uma instalacao da outra: caminho, versao e
