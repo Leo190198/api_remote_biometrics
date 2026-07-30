@@ -28,6 +28,7 @@ import (
 	"runtime"
 	"runtime/debug"
 	"strings"
+	"syscall"
 	"time"
 
 	"golang.org/x/sys/windows"
@@ -445,6 +446,112 @@ func confereTemplate(caminho string) int {
 	}
 	fmt.Println("OK: o template confere consigo mesmo nesta maquina")
 	return 0
+}
+
+// testeForma roda UM caso da matriz de forma x ponto de entrada, e sai.
+//
+// A captura atravessa o gancho de API do servidor RDP sem problema, entao ele
+// nao esta quebrado inteiro - intercepta os simbolos que conhece, com o
+// marshaling que conseguiu implementar. Duas coisas podem variar:
+//
+//   - a forma do INPUT_FIR. HANDLE sao dois inteiros; TEXTENCODE e ponteiro
+//     para struct que aponta para string, bem mais dificil de marshalar.
+//   - a funcao chamada. NBioAPI_VerifyMatch e a obvia e certamente enganchada;
+//     NBioAPI_CompareTwoFIR faz o mesmo trabalho e pode ter passado batido.
+//
+// O parametro e o valor da constante de forma do NBioAPI_INPUT_FIR:
+//
+//	1, 3  guardam o handle direto na uniao (candidatos a forma de handle)
+//	4     e a forma de texto, o caminho atual, e serve de referencia
+//
+// O valor 2 ja foi descartado na maquina sadia: o SDK respondeu "ponteiro
+// invalido", ou seja, trata a uniao como endereco. NBioAPI_CompareTwoFIR
+// tambem foi descartado - derrubou o processo no mesmo endereco com as duas
+// formas, o que aponta assinatura errada da nossa parte, e nao o gancho.
+//
+// Um caso por processo, de proposito. A primeira versao rodava tudo em
+// sequencia e o primeiro caso derrubou o processo levando junto os que ainda
+// nao tinham rodado. Isolar custa uma encostada de dedo a mais e garante que
+// todo caso seja medido.
+//
+// As formas de handle capturam; a de texto le o arquivo que a captura gravou,
+// entao reaproveita o mesmo dedo.
+func testeForma(caso int, arquivo string) int {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	ligaConsole()
+
+	sdk, dll, err := abreSDKDireto()
+	if err != nil {
+		fmt.Println("erro ao abrir o SDK:", err)
+		return 1
+	}
+	defer func() { _ = sdk.encerra() }()
+
+	fmt.Println("matriz de forma x ponto de entrada - versao", versao, "commit", commit)
+	fmt.Println("horario:", time.Now().Format("2006-01-02 15:04:05"))
+	fmt.Println("DLL:", descreveDLL(dll))
+	for _, m := range modulosBiometricos() {
+		fmt.Println("modulo:", m)
+	}
+
+	const simbolo = "NBioAPI_VerifyMatch"
+	proc := syscall.NewLazyDLL(dll).NewProc(simbolo)
+
+	porHandle := caso != formTextEncode
+	rotulo := fmt.Sprintf("HANDLE na forma %d", caso)
+	if !porHandle {
+		rotulo = "TEXTO (forma 4)"
+	}
+	fmt.Printf("caso: %s x %s\n", rotulo, simbolo)
+
+	var inA, inB uintptr
+	if porHandle {
+		fmt.Println()
+		fmt.Println(">>> Encoste o dedo no leitor")
+		handle, err := sdk.capturaHandle(purposeEnroll, 30000)
+		if err != nil {
+			fmt.Println("erro na captura:", err)
+			return 1
+		}
+		defer sdk.liberaFIR(handle)
+		fmt.Printf("capturado, handle 0x%08x\n", handle)
+
+		// Grava o texto para os casos de TEXTO reaproveitarem o mesmo dedo.
+		if texto, err := sdk.textoDoHandle(handle); err == nil && arquivo != "" {
+			if err := os.WriteFile(arquivo, []byte(texto), 0o600); err == nil {
+				fmt.Println(forma("texto do mesmo FIR, gravado para os casos de TEXTO", texto))
+			}
+		}
+		inA = novaInputHandleNativa(uint32(caso), handle)
+		inB = novaInputHandleNativa(uint32(caso), handle)
+	} else {
+		dados, err := os.ReadFile(arquivo)
+		if err != nil {
+			fmt.Println("erro ao ler o template:", err)
+			return 1
+		}
+		texto := string(dados)
+		fmt.Println(forma("template lido do arquivo", texto))
+		inA, inB = novaInputFIRNativa(texto), novaInputFIRNativa(texto)
+	}
+	defer nativoLibera(inA)
+	defer nativoLibera(inB)
+
+	fmt.Println()
+	fmt.Printf("passo: chamando %s com %s\n", simbolo, rotulo)
+	confere, err := sdk.comparaComEntrada(proc, simbolo, inA, inB, true)
+	switch {
+	case err != nil:
+		fmt.Printf("caso %d: FALHOU: %v\n", caso, err)
+		return 1
+	case !confere:
+		fmt.Printf("caso %d: nao conferiu, e o SDK nao acusou erro\n", caso)
+		return 1
+	default:
+		fmt.Printf("caso %d: OK, conferiu consigo mesma\n", caso)
+		return 0
+	}
 }
 
 func (a *autoteste) encerra() int {

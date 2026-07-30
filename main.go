@@ -827,9 +827,22 @@ func executa() int {
 	if len(os.Args) > 2 && os.Args[1] == "--conferir-template" {
 		return confereTemplate(os.Args[2])
 	}
+	if len(os.Args) > 3 && os.Args[1] == "--teste-forma" {
+		caso, err := strconv.Atoi(os.Args[2])
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "teste-forma: caso precisa ser 1, 2, 3 ou 4")
+			return 1
+		}
+		return testeForma(caso, os.Args[3])
+	}
 	// O worker herda BIO_FILHO do agente, entao precisa ser testado antes.
 	if os.Getenv("BIO_WORKER") == "1" {
 		return workerMain()
+	}
+	// O comparador vem antes do supervisor e da bandeja: e um servico de
+	// servidor, sem sessao Windows, sem leitor e sem interface.
+	if os.Getenv("MODO_COMPARADOR") == "1" || (len(os.Args) > 1 && os.Args[1] == "--comparador") {
+		return rodaComparador()
 	}
 	if os.Getenv("BIO_FILHO") != "1" {
 		if !instanciaUnica() {

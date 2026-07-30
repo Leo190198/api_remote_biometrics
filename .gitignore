@@ -1,5 +1,8 @@
 # Artefatos de compilacao e diagnostico
 /AgenteBiometria.exe
+# Builds de diagnostico (AgenteBiometria-diag7.exe, -forma.exe, ...).
+/AgenteBiometria-*.exe
+/testar-*.cmd
 # Nome padrao do "go build" sem -o: vem do modulo (agente-biometria).
 /agente-biometria.exe
 /build-err.txt
