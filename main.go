@@ -324,6 +324,13 @@ func handleStatus(w http.ResponseWriter, r *http.Request) {
 		"dll": dllOuNada(), "arch": "386", "https": usaTLS,
 		"versao": versao, "commit": commit,
 	}
+	// Onde a comparacao acontece e a primeira pergunta quando um agente confere
+	// e o outro nao, e ela nao se responde olhando o log da estacao errada.
+	if comparadorRemoto != nil {
+		info["comparador"] = comparadorRemoto.base
+	} else {
+		info["comparador"] = "local"
+	}
 	if err != nil {
 		info["ok"] = false
 		info["erro"] = err.Error()
@@ -424,13 +431,21 @@ func handleComparar(w http.ResponseWriter, r *http.Request) {
 		impressaoTemplate(body.BiometriaBenef), impressaoTemplate(body.BiometriaLida))
 	ctx, cancel := context.WithTimeout(r.Context(), 45*time.Second)
 	defer cancel()
-	ok, err := naThreadSDK(ctx, func() (bool, error) {
-		s, err := ensureSDK()
-		if err != nil {
-			return false, err
-		}
-		return s.comparaTextos(body.BiometriaBenef, body.BiometriaLida)
-	})
+	var ok bool
+	var err error
+	if comparadorRemoto != nil {
+		// Nao passa pela thread do SDK: aqui nao se toca na DLL, e enfileirar a
+		// chamada atras de uma captura de 30 segundos so somaria espera.
+		ok, err = comparadorRemoto.compara(ctx, body.BiometriaBenef, body.BiometriaLida)
+	} else {
+		ok, err = naThreadSDK(ctx, func() (bool, error) {
+			s, err := ensureSDK()
+			if err != nil {
+				return false, err
+			}
+			return s.comparaTextos(body.BiometriaBenef, body.BiometriaLida)
+		})
+	}
 	if err != nil {
 		registraErro("comparacao: %v", err)
 		escreveErro(w, http.StatusBadGateway, err.Error())
@@ -521,14 +536,20 @@ func handleIdentificar(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 4*time.Minute)
 	defer cancel()
-	res, err := naThreadSDK(ctx, func() (resultadoIdentificacao, error) {
-		s, err := ensureSDK()
-		if err != nil {
-			return resultadoIdentificacao{}, err
-		}
-		id, pulados, err := s.identifica(body.Lida, validos)
-		return resultadoIdentificacao{id: id, ignorados: pulados}, err
-	})
+	var res resultadoIdentificacao
+	var err error
+	if comparadorRemoto != nil {
+		res, err = comparadorRemoto.identifica(ctx, body.Lida, validos)
+	} else {
+		res, err = naThreadSDK(ctx, func() (resultadoIdentificacao, error) {
+			s, err := ensureSDK()
+			if err != nil {
+				return resultadoIdentificacao{}, err
+			}
+			id, pulados, err := s.identifica(body.Lida, validos)
+			return resultadoIdentificacao{id: id, ignorados: pulados}, err
+		})
+	}
 	if err != nil {
 		registraErro("identificacao: %v", err)
 		escreveErro(w, http.StatusBadGateway, err.Error())
@@ -827,13 +848,8 @@ func executa() int {
 	if len(os.Args) > 2 && os.Args[1] == "--conferir-template" {
 		return confereTemplate(os.Args[2])
 	}
-	if len(os.Args) > 3 && os.Args[1] == "--teste-forma" {
-		caso, err := strconv.Atoi(os.Args[2])
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "teste-forma: caso precisa ser 1, 2, 3 ou 4")
-			return 1
-		}
-		return testeForma(caso, os.Args[3])
+	if len(os.Args) > 1 && os.Args[1] == "--teste-delegacao" {
+		return testeDelegacao()
 	}
 	// O worker herda BIO_FILHO do agente, entao precisa ser testado antes.
 	if os.Getenv("BIO_WORKER") == "1" {
@@ -857,6 +873,7 @@ func executa() int {
 	ctxApp, cancelaApp = context.WithCancel(context.Background())
 	defer cancelaApp()
 	origens = novoGerenciadorOrigens()
+	configuraComparador()
 	defineDLL(achaDLL())
 	// Qual DLL foi escolhida e a primeira pergunta de qualquer diagnostico, e
 	// era a unica que o log nao respondia.

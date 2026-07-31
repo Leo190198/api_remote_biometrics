@@ -21,6 +21,7 @@ package main
 // dentro: so tamanho, caracteres das pontas e um sha256 curto.
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -28,7 +29,6 @@ import (
 	"runtime"
 	"runtime/debug"
 	"strings"
-	"syscall"
 	"time"
 
 	"golang.org/x/sys/windows"
@@ -448,38 +448,38 @@ func confereTemplate(caminho string) int {
 	return 0
 }
 
-// testeForma roda UM caso da matriz de forma x ponto de entrada, e sai.
+// testeDelegacao exercita o desenho inteiro de uma vez: captura aqui, dentro da
+// sessao RDP, e manda comparar no comparador, que roda em sessao 0.
 //
-// A captura atravessa o gancho de API do servidor RDP sem problema, entao ele
-// nao esta quebrado inteiro - intercepta os simbolos que conhece, com o
-// marshaling que conseguiu implementar. Duas coisas podem variar:
-//
-//   - a forma do INPUT_FIR. HANDLE sao dois inteiros; TEXTENCODE e ponteiro
-//     para struct que aponta para string, bem mais dificil de marshalar.
-//   - a funcao chamada. NBioAPI_VerifyMatch e a obvia e certamente enganchada;
-//     NBioAPI_CompareTwoFIR faz o mesmo trabalho e pode ter passado batido.
-//
-// O parametro e o valor da constante de forma do NBioAPI_INPUT_FIR:
-//
-//	1, 3  guardam o handle direto na uniao (candidatos a forma de handle)
-//	4     e a forma de texto, o caminho atual, e serve de referencia
-//
-// O valor 2 ja foi descartado na maquina sadia: o SDK respondeu "ponteiro
-// invalido", ou seja, trata a uniao como endereco. NBioAPI_CompareTwoFIR
-// tambem foi descartado - derrubou o processo no mesmo endereco com as duas
-// formas, o que aponta assinatura errada da nossa parte, e nao o gancho.
-//
-// Um caso por processo, de proposito. A primeira versao rodava tudo em
-// sequencia e o primeiro caso derrubou o processo levando junto os que ainda
-// nao tinham rodado. Isolar custa uma encostada de dedo a mais e garante que
-// todo caso seja medido.
-//
-// As formas de handle capturam; a de texto le o arquivo que a captura gravou,
-// entao reaproveita o mesmo dedo.
-func testeForma(caso int, arquivo string) int {
+// E o caminho de producao, nao uma imitacao dele - usa o mesmo cliente que o
+// handler /captura usa. Compara o template com ele mesmo de proposito: assim o
+// veredito nao depende da qualidade da leitura, e um "nao conferiu" significa
+// que a comparacao continua corrompida, nunca que o dedo saiu torto.
+func testeDelegacao() int {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 	ligaConsole()
+
+	configuraComparador()
+	if comparadorRemoto == nil {
+		fmt.Println("Defina COMPARADOR_URL e COMPARADOR_TOKEN antes de rodar este teste.")
+		fmt.Println("Exemplo: set COMPARADOR_URL=http://127.0.0.1:5150")
+		return 1
+	}
+
+	fmt.Println("teste da delegacao - versao", versao, "commit", commit)
+	fmt.Println("horario:", time.Now().Format("2006-01-02 15:04:05"))
+	fmt.Println("comparador:", comparadorRemoto.base)
+
+	// A lista importa aqui: este processo PRECISA estar enganchado para o teste
+	// significar alguma coisa. Sem gancho, ele so provaria que dois processos
+	// sadios conversam por HTTP.
+	if temGanchoDeRedirecionamento() {
+		fmt.Println("gancho da FabulaTech: PRESENTE neste processo (era o esperado)")
+	} else {
+		fmt.Println("gancho da FabulaTech: ausente neste processo.")
+		fmt.Println("=> Fora da sessao RDP o teste nao prova nada. Rode dentro dela.")
+	}
 
 	sdk, dll, err := abreSDKDireto()
 	if err != nil {
@@ -487,71 +487,47 @@ func testeForma(caso int, arquivo string) int {
 		return 1
 	}
 	defer func() { _ = sdk.encerra() }()
-
-	fmt.Println("matriz de forma x ponto de entrada - versao", versao, "commit", commit)
-	fmt.Println("horario:", time.Now().Format("2006-01-02 15:04:05"))
 	fmt.Println("DLL:", descreveDLL(dll))
-	for _, m := range modulosBiometricos() {
-		fmt.Println("modulo:", m)
-	}
-
-	const simbolo = "NBioAPI_VerifyMatch"
-	proc := syscall.NewLazyDLL(dll).NewProc(simbolo)
-
-	porHandle := caso != formTextEncode
-	rotulo := fmt.Sprintf("HANDLE na forma %d", caso)
-	if !porHandle {
-		rotulo = "TEXTO (forma 4)"
-	}
-	fmt.Printf("caso: %s x %s\n", rotulo, simbolo)
-
-	var inA, inB uintptr
-	if porHandle {
-		fmt.Println()
-		fmt.Println(">>> Encoste o dedo no leitor")
-		handle, err := sdk.capturaHandle(purposeEnroll, 30000)
-		if err != nil {
-			fmt.Println("erro na captura:", err)
-			return 1
-		}
-		defer sdk.liberaFIR(handle)
-		fmt.Printf("capturado, handle 0x%08x\n", handle)
-
-		// Grava o texto para os casos de TEXTO reaproveitarem o mesmo dedo.
-		if texto, err := sdk.textoDoHandle(handle); err == nil && arquivo != "" {
-			if err := os.WriteFile(arquivo, []byte(texto), 0o600); err == nil {
-				fmt.Println(forma("texto do mesmo FIR, gravado para os casos de TEXTO", texto))
-			}
-		}
-		inA = novaInputHandleNativa(uint32(caso), handle)
-		inB = novaInputHandleNativa(uint32(caso), handle)
-	} else {
-		dados, err := os.ReadFile(arquivo)
-		if err != nil {
-			fmt.Println("erro ao ler o template:", err)
-			return 1
-		}
-		texto := string(dados)
-		fmt.Println(forma("template lido do arquivo", texto))
-		inA, inB = novaInputFIRNativa(texto), novaInputFIRNativa(texto)
-	}
-	defer nativoLibera(inA)
-	defer nativoLibera(inB)
 
 	fmt.Println()
-	fmt.Printf("passo: chamando %s com %s\n", simbolo, rotulo)
-	confere, err := sdk.comparaComEntrada(proc, simbolo, inA, inB, true)
+	fmt.Println(">>> Encoste o dedo no leitor")
+	template, err := sdk.capturaTexto(purposeEnroll, 30000)
+	if err != nil {
+		fmt.Println("FALHOU na captura:", err)
+		return 1
+	}
+	fmt.Println(forma("template capturado", template))
+
+	fmt.Println()
+	fmt.Println("passo: enviando ao comparador em sessao 0")
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	confere, err := comparadorRemoto.compara(ctx, template, template)
 	switch {
 	case err != nil:
-		fmt.Printf("caso %d: FALHOU: %v\n", caso, err)
+		fmt.Println("FALHOU:", err)
 		return 1
 	case !confere:
-		fmt.Printf("caso %d: nao conferiu, e o SDK nao acusou erro\n", caso)
+		fmt.Println("NAO CONFERIU consigo mesmo, e o comparador nao acusou erro.")
+		fmt.Println("=> A comparacao continua corrompida. O desenho nao resolve.")
 		return 1
 	default:
-		fmt.Printf("caso %d: OK, conferiu consigo mesma\n", caso)
+		fmt.Println("OK: conferiu.")
+		fmt.Println("=> A captura roda na sessao RDP e a comparacao roda fora da jaula.")
 		return 0
 	}
+}
+
+// temGanchoDeRedirecionamento diz se os modulos da FabulaTech estao dentro
+// deste processo.
+func temGanchoDeRedirecionamento() bool {
+	for _, m := range modulosBiometricos() {
+		baixo := strings.ToLower(m)
+		if strings.HasPrefix(baixo, "ftapihook") || strings.HasPrefix(baixo, "ftfpstub") {
+			return true
+		}
+	}
+	return false
 }
 
 func (a *autoteste) encerra() int {
