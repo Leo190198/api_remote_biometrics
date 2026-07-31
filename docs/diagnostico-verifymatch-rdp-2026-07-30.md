@@ -178,6 +178,58 @@ com as faixas dos módulos).
 
 ---
 
+## Continuação — 2026-07-31: a solução
+
+### O que foi eliminado nesta rodada
+
+| hipótese | como foi eliminada |
+|---|---|
+| Outro ponto de entrada da API plana resolve | `NBioAPI_Verify` (captura e compara numa chamada só, passando pelo leitor) **também derruba o processo**, em `0x66835987`, dentro da faixa da `NBioBSP.dll`. Registrado em `verify.log` |
+| O objeto COM (`NBioBSPCOM.dll`) tem matcher próprio | Não tem. É um invólucro ATL fino: importa `NBioBSP.dll` e chama `NBioAPI_CompareTwoFIR`, que já havia sido descartado por derrubar o processo |
+| O wrapper .NET (`NITGEN.SDK.NBioBSP.dll`) usa outro caminho | Não usa. É `DllImport` na mesma `NBioBSP.dll` |
+
+Ou seja: **o problema não é a função chamada**. Todo caminho de comparação da NITGEN termina no mesmo código corrompido. Procurar outra assinatura era beco sem saída.
+
+### Como o gancho entra
+
+Não é injeção global. Medido em `10.10.11.30`:
+
+- `AppInit_DLLs` está **vazio** e `LoadAppInit_DLLs` é `0`.
+- `AppCertDlls` **não existe**.
+- Existe o driver **`ftsjail.sys` 3.4.1.2**, mesma versão do `ftapihook32.dll`.
+
+O nome diz o desenho: *session jail*. O driver injeta o gancho nos processos **de uma sessão**, que é onde o dispositivo redirecionado precisa aparecer. Serviços não têm sessão de usuário nem leitor redirecionado, então não há por que enjaulá-los.
+
+### A medição que abriu a saída
+
+Rodando o mesmo binário nos dois ambientes do **mesmo servidor**:
+
+| | sessão RDP | sessão 0 (SYSTEM) |
+|---|---|---|
+| `ftapihook32.dll` | carregado em `0x6cbc0000` | **ausente** |
+| `ftfpstub.dll` | carregado em `0x6c1b0000` | **ausente** |
+| `FTCOMS~1.DLL` | carregado em `0x70750000` | **ausente** |
+
+A sessão 0 está limpa. Não é preciso tirar a comparação da máquina — basta tirá-la da **sessão**.
+
+Isso também explica por que o ERP da P&F compara sem problema neste mesmo servidor: a comparação dele roda do lado servidor, fora da jaula.
+
+### O desenho
+
+A sessão RDP captura, porque só ela enxerga o leitor. A sessão 0 compara, porque só ela tem a DLL intacta.
+
+- O modo comparador (`--comparador`) roda como tarefa agendada `SYSTEM`, em `ONSTART`.
+- O agente da sessão recebe `COMPARADOR_URL` e `COMPARADOR_TOKEN`, e passa a delegar `/captura` e `/identificar` (`delegacao.go`).
+- Sem essas variáveis nada muda: na estação de trabalho, onde não há gancho, o agente segue comparando sozinho.
+
+Verificação de ponta a ponta, de dentro da sessão RDP:
+
+```
+AgenteBiometria.exe --teste-delegacao
+```
+
+Ele captura, exige que o gancho **esteja** presente neste processo — senão o teste não provaria nada — e manda o comparador conferir o template com ele mesmo, para o veredito não depender da qualidade da leitura.
+
 ## Ambiente
 
 | | workstation | `10.10.11.30` |

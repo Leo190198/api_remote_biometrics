@@ -54,8 +54,10 @@ if (r.confere) alert('É o beneficiário ' + r.id);
 else alert('Digital não encontrada');
 ```
 
-Se o agente da máquina for antigo (sem o endpoint `/identificar`), o script
-cai sozinho no loop de `comparar` — funciona igual, só mais devagar.
+Contra um agente antigo, sem o endpoint `/identificar`, a chamada falha com
+`HTTP 404` — **o script não cai sozinho no loop de `comparar`**. Se você
+precisa suportar agentes antigos, trate o `404` e faça o loop no seu código,
+ou atualize o agente.
 
 ## 3) Como o script sabe a PORTA e o TOKEN da sessão
 
@@ -101,6 +103,23 @@ Rode como administrador, com o exe ao lado do script:
 powershell -ExecutionPolicy Bypass -File instalar-servidor.ps1
 ```
 
+**Num servidor RDP com o redirecionamento da FabulaTech, acrescente
+`-InstalarComparador`:**
+
+```powershell
+powershell -ExecutionPolicy Bypass -File instalar-servidor.ps1 -InstalarComparador
+```
+
+Nesse ambiente a comparação não pode rodar dentro da sessão: o driver
+`ftsjail.sys` injeta um gancho em todo processo dela e a `NBioBSP.dll` passa a
+corromper memória. A sessão 0 não é alcançada, então o comparador vira um
+serviço no próprio servidor e a sessão só captura.
+
+**Isso não muda nada no seu código.** `Biometria.comparar()` e
+`Biometria.identificar()` continuam idênticos — quem decide onde comparar é o
+agente, não o navegador. Detalhes em
+[docs/diagnostico-verifymatch-rdp-2026-07-30.md](../docs/diagnostico-verifymatch-rdp-2026-07-30.md).
+
 Isso copia o agente para Program Files, registra o certificado e o
 auto-início em HKLM: **cada usuário que logar (cada sessão RDP) ganha
 automaticamente o seu agente** na bandeja, com porta e token próprios.
@@ -111,4 +130,15 @@ O agente roda com um supervisor: se crashar, é reiniciado sozinho em segundos.
 - **Outro host:** se o sistema chama o agente a partir de outro nome de host,
   o certificado só cobre `localhost`/`127.0.0.1` — mantenha as chamadas em
   `localhost`.
-- **CORS:** já liberado pelo agente (`Access-Control-Allow-Origin: *`).
+- **CORS:** o agente responde `Access-Control-Allow-Origin` com a **sua origem
+  exata**, nunca `*`, e só depois que ela for autorizada — pela bandeja
+  (**Autorizar acesso**) ou previamente por `CORS_ORIGEM`. Origem não
+  autorizada leva `403`. Não conte com liberação geral.
+- **`comparar` falhando com "comparador inacessivel":** só aparece onde a
+  comparação foi delegada (servidor RDP). Significa que o serviço da sessão 0
+  caiu, não que a digital não confere nem que o leitor tem problema. Verifique
+  a tarefa `AgenteBiometriaComparador`. O script **não** tenta reconectar nesse
+  caso, e está certo: reconectar ao agente não levanta um serviço caído.
+- **Onde a comparação acontece:** `GET /api/status` traz o campo `comparador`,
+  com `local` ou a URL do serviço. É a primeira coisa a olhar quando uma
+  máquina confere e outra não.

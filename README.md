@@ -48,6 +48,29 @@ flowchart LR
 
 O sistema web é responsável por armazenar os templates biométricos. O agente apenas captura, compara e devolve os resultados; ele não mantém uma base local de digitais.
 
+### Dentro de um servidor RDP
+
+Num servidor com o **FabulaTech Biometrics for Remote Desktop**, a comparação não pode acontecer no processo do agente. O driver `ftsjail.sys` injeta `ftapihook32.dll` em todo processo da sessão RDP, e com ele no caminho qualquer comparação morre dentro da `NBioBSP.dll` — `NBioAPI_VerifyMatch` e `NBioAPI_Verify` caem no mesmo endereço. A captura passa ilesa, porque é justamente o que o redirecionador foi feito para implementar.
+
+A sessão 0 não é alcançada pelo driver. Então a comparação sai da sessão e vai para um serviço no **mesmo servidor**:
+
+```mermaid
+flowchart LR
+    subgraph RDP["Sessão RDP — com o gancho da FabulaTech"]
+        AG["Agente<br/>captura"]
+    end
+    subgraph S0["Sessão 0 — sem o gancho"]
+        CP["Modo comparador<br/>porta 5150"]
+    end
+    AG -->|"leitor redirecionado"| READER2["Leitor na estação"]
+    AG -->|"COMPARADOR_URL<br/>127.0.0.1 + token"| CP
+    CP --> DLL2["NBioBSP.dll intacta"]
+```
+
+Basta definir `COMPARADOR_URL` e `COMPARADOR_TOKEN` no agente: `/captura` e `/identificar` passam a ser atendidos pelo comparador, e a captura continua local. Sem essas variáveis o agente compara sozinho, que é o certo na estação de trabalho.
+
+O detalhe todo está em [docs/diagnostico-verifymatch-rdp-2026-07-30.md](docs/diagnostico-verifymatch-rdp-2026-07-30.md).
+
 ## Requisitos
 
 - Windows com arquitetura x64 ou x86, executando o agente compilado para `windows/386`.
@@ -176,7 +199,7 @@ Os IDs precisam ser strings únicas e não vazias. Cada chamada aceita entre 1 e
 |---|---|---|
 | `GET` | `/api/hello` | Descobre o agente e inicia a autorização da origem. |
 | `GET` | `/api/ping` | Confirma que a API está respondendo. |
-| `GET` | `/api/status` | Informa versão, DLL e quantidade de leitores. |
+| `GET` | `/api/status` | Informa versão, DLL, quantidade de leitores e onde a comparação acontece (`comparador`: `local` ou a URL do serviço). |
 | `POST` | `/api/public/v1/captura/Capturar` | Captura um template para verificação. |
 | `POST` | `/api/public/v1/captura/Enroll` | Captura um template de cadastro. |
 | `POST` | `/api/public/v1/captura` | Compara dois templates. |
@@ -192,6 +215,9 @@ Com exceção de `/api/hello`, as rotas exigem o token da sessão no cabeçalho 
 | `CORS_ORIGEM` | Lista de origens exatas previamente autorizadas, separadas por vírgula ou ponto e vírgula. |
 | `PORTA` | Fixa uma porta em vez de usar a descoberta entre `5000–5099`. |
 | `NBIOBSP_DLL` | Define manualmente o caminho da `NBioBSP.dll`. |
+| `COMPARADOR_URL` | Delega comparação e identificação a um comparador (ex.: `http://127.0.0.1:5150`). Sem ela, o agente compara localmente. |
+| `COMPARADOR_TOKEN` | Segredo compartilhado com o comparador, mínimo de 32 caracteres. Exigido dos dois lados. |
+| `COMPARADOR_PORTA` | Porta do modo comparador. O padrão é `5150`. |
 
 O curinga `*` não é aceito em `CORS_ORIGEM`.
 
