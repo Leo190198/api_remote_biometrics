@@ -1,4 +1,4 @@
-# 🔍 Review do PR #NN: docs: revisão técnica do sistema — 2026-08-05
+# 🔍 Review do PR #8: docs: revisão técnica do sistema — 2026-08-05
 
 Oitava revisão técnica do sistema, sobre o commit `d1c3846` — o mesmo desde
 2026-08-01. Nenhuma correção das sete revisões anteriores foi aplicada.
