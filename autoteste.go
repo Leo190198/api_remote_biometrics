@@ -357,65 +357,103 @@ func abreSDKDireto() (*nbio, string, error) {
 	return sdk, dll, nil
 }
 
-// salvaTemplate captura um template e grava o texto num arquivo, sem comparar
-// nada.
+// ehNomeDeVariavel reconhece a chave de uma linha CHAVE=valor.
 //
-// Junto com confereTemplate, separa as duas metades do SDK, que ate agora so
-// foram testadas na mesma maquina e por isso sempre falharam ou passaram juntas:
-//
-//   - template gerado na maquina sadia PASSA na doente  -> o comparador de la
-//     esta bom, e quem produz dado ruim e o extrator/leitor.
-//   - template gerado na maquina sadia FALHA na doente  -> o comparador e que
-//     esta quebrado, e o leitor nao tem culpa.
-//
-// E a unica pergunta que sobrou depois que a versao da DLL foi descartada: a
-// mesma DLL, byte a byte, passa numa maquina e falha na outra.
-func salvaTemplate(caminho string) int {
-	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
-	ligaConsole()
-
-	sdk, dll, err := abreSDKDireto()
-	if err != nil {
-		fmt.Println("erro ao abrir o SDK:", err)
-		return 1
+// Serve para nao confundir com o '=' de preenchimento do base64: um template
+// pode terminar em '==', e cortar ali destruiria o dado.
+func ehNomeDeVariavel(s string) bool {
+	if s == "" || len(s) > 64 {
+		return false
 	}
-	defer func() { _ = sdk.encerra() }()
-	fmt.Println("DLL:", descreveDLL(dll))
-	if ids, err := sdk.listaDispositivos(); err == nil && len(ids) > 0 {
-		fmt.Printf("IDs dos leitores: %v\n", ids)
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		letra := c == '_' || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')
+		digito := i > 0 && c >= '0' && c <= '9'
+		if !letra && !digito {
+			return false
+		}
 	}
-
-	fmt.Println(">>> Encoste o dedo no leitor")
-	template, err := sdk.capturaTexto(purposeEnroll, 30000)
-	if err != nil {
-		fmt.Println("erro na captura:", err)
-		return 1
-	}
-	if err := os.WriteFile(caminho, []byte(template), 0o600); err != nil {
-		fmt.Println("erro ao gravar:", err)
-		return 1
-	}
-	fmt.Println(forma("template salvo", template))
-	fmt.Println("arquivo:", caminho)
-	return 0
+	return true
 }
 
-// confereTemplate le um template de arquivo e o compara com ele mesmo.
+// leTemplateDeArquivo aceita o template puro ou uma linha CHAVE=valor, que e
+// como um cadastro sai do banco para um arquivo de ambiente.
+func leTemplateDeArquivo(caminho string) (string, string, error) {
+	dados, err := os.ReadFile(caminho)
+	if err != nil {
+		return "", "", err
+	}
+	texto := strings.TrimSpace(string(dados))
+
+	// Tenta CHAVE=valor, mas so aceita a separacao se o que sobra for um
+	// template valido. Parecer nome de variavel nao basta: um template base64
+	// sem simbolos, com menos de 64 caracteres antes do '=' de preenchimento,
+	// passa por nome perfeitamente - e ai o dado seria cortado em silencio, e a
+	// falha apareceria como "template invalido" sem ninguem ligar uma coisa a
+	// outra. Exigir que o valor sirva desfaz a ambiguidade.
+	if i := strings.IndexByte(texto, '='); i > 0 {
+		chave := strings.TrimSpace(texto[:i])
+		valor := strings.TrimSpace(texto[i+1:])
+		if ehNomeDeVariavel(chave) {
+			if limpo := normalizaTemplate(valor); limpo != "" {
+				return chave, limpo, nil
+			}
+		}
+	}
+
+	limpo := normalizaTemplate(texto)
+	if limpo == "" {
+		return "", "", fmt.Errorf("nao parece um template do NBioBSP (%d caracteres apos limpar)", len(texto))
+	}
+	return "", limpo, nil
+}
+
+// confereContra compara um cadastro guardado com o dedo encostado agora.
 //
-// Nao encosta no leitor: VerifyMatch nao precisa de dispositivo aberto. Da para
-// rodar numa maquina sem hardware nenhum, e e so o comparador sendo exercitado.
-func confereTemplate(caminho string) int {
+// E a verificacao 1:1 de producao, feita pela linha de comando: le o template
+// de um arquivo, captura no leitor e pergunta ao SDK se e a mesma pessoa. Usa o
+// comparador quando ha um anunciado, que e o que faz isso funcionar dentro de
+// uma sessao RDP.
+//
+// Os codigos de saida separam as tres respostas, porque "nao e a pessoa" e
+// "quebrou" pedem providencias opostas:
+//
+//	0  confere
+//	1  falhou (erro de leitura, de SDK ou de comparador)
+//	2  nao confere
+func confereContra(caminho string) int {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 	ligaConsole()
+	configuraComparador()
 
-	dados, err := os.ReadFile(caminho)
+	chave, guardado, err := leTemplateDeArquivo(caminho)
 	if err != nil {
-		fmt.Println("erro ao ler o arquivo:", err)
+		fmt.Println("erro ao ler o template guardado:", err)
 		return 1
 	}
-	template := string(dados)
+
+	fmt.Println("verificacao 1:1 - versao", versao, "commit", commit)
+	fmt.Println("horario:", time.Now().Format("2006-01-02 15:04:05"))
+	fmt.Println("arquivo:", caminho)
+	if chave != "" {
+		fmt.Println("chave:", chave)
+	}
+	// Nunca o template em si: e dado pessoal irrevogavel. Tamanho e sha256
+	// curto bastam para reconhecer o mesmo cadastro entre execucoes e para
+	// flagrar truncamento por coluna curta no banco.
+	fmt.Println(forma("template guardado", guardado))
+
+	if comparadorRemoto != nil {
+		fmt.Println("comparacao:", comparadorRemoto.base, "(fora da sessao)")
+	} else {
+		fmt.Println("comparacao: local, neste processo")
+		if temGanchoDeRedirecionamento() {
+			fmt.Println("  ATENCAO: ha gancho de redirecionamento neste processo e nenhum")
+			fmt.Println("  comparador anunciado. A comparacao vai falhar ou derrubar o")
+			fmt.Println("  processo. Instale o servico comparador nesta maquina.")
+		}
+	}
 
 	sdk, dll, err := abreSDKDireto()
 	if err != nil {
@@ -424,28 +462,40 @@ func confereTemplate(caminho string) int {
 	}
 	defer func() { _ = sdk.encerra() }()
 	fmt.Println("DLL:", descreveDLL(dll))
-	if ids, err := sdk.listaDispositivos(); err == nil && len(ids) > 0 {
-		fmt.Printf("IDs dos leitores: %v\n", ids)
-	}
-	fmt.Println(forma("template lido do arquivo", template))
 
-	// Impresso antes da comparacao de proposito: se a DLL derrubar o processo,
-	// esta lista ja esta na saida e o PC da falha cai dentro de uma das faixas.
-	for _, m := range modulosBiometricos() {
-		fmt.Println("modulo:", m)
+	fmt.Println()
+	fmt.Println(">>> Encoste o dedo no leitor")
+	lido, err := sdk.capturaTexto(purposeVerify, 30000)
+	if err != nil {
+		fmt.Println("FALHOU na captura:", err)
+		return 1
+	}
+	fmt.Println(forma("template lido agora", lido))
+
+	fmt.Println()
+	fmt.Println("passo: comparando")
+	var confere bool
+	if comparadorRemoto != nil {
+		ctx, cancela := context.WithTimeout(context.Background(), 45*time.Second)
+		defer cancela()
+		confere, err = comparadorRemoto.compara(ctx, guardado, lido)
+	} else {
+		confere, err = sdk.comparaTextos(guardado, lido)
 	}
 
-	confere, err := sdk.comparaBrutos(template, template)
+	fmt.Println()
 	switch {
 	case err != nil:
 		fmt.Println("FALHOU:", err)
 		return 1
-	case !confere:
-		fmt.Println("FALHOU: nao conferiu consigo mesmo, e o SDK nao acusou erro")
-		return 1
+	case confere:
+		fmt.Println("  >>> CONFERE <<<")
+		return 0
+	default:
+		fmt.Println("  >>> NAO CONFERE <<<")
+		fmt.Println("  Dedo diferente do cadastrado, ou leitura de qualidade ruim.")
+		return 2
 	}
-	fmt.Println("OK: o template confere consigo mesmo nesta maquina")
-	return 0
 }
 
 // testeDelegacao exercita o desenho inteiro de uma vez: captura aqui, dentro da

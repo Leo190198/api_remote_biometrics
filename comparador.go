@@ -29,15 +29,24 @@ import (
 
 const portaComparadorPadrao = 5150
 
-// rodaComparador sobe o servico e so retorna quando ele cai.
-func rodaComparador() int {
-	iniciaLogArquivo("comparador.log")
+func rodaComparador() int { return rodaComparadorCom(nil) }
 
-	segredo := os.Getenv("COMPARADOR_TOKEN")
-	if len(segredo) < 32 {
-		fmt.Fprintln(os.Stderr, "COMPARADOR_TOKEN ausente ou curto demais (minimo 32 caracteres).")
+// rodaComparadorCom sobe o servico e so retorna quando ele cai ou quando
+// cancelaApp e chamado. Se pronto nao for nil, e fechado assim que a porta
+// esta aceitando conexoes - e o que o servico espera para reportar Running.
+func rodaComparadorCom(pronto chan<- struct{}) int {
+	// Ao lado do anuncio, e nao no perfil do usuario: como servico, o perfil e
+	// o do SYSTEM, e o log sumiria dentro de SysWOW64\config\systemprofile.
+	iniciaLogEm(diretorioCompartilhado(), "comparador.log")
+
+	// O segredo deixou de vir so do ambiente: o servico gera o seu e publica
+	// junto com a porta, para o agente de cada sessao achar sem depender de
+	// variavel de maquina, que uma sessao ja aberta nao enxerga.
+	segredo, err := tokenDoComparador()
+	if err != nil || len(segredo) < 32 {
+		fmt.Fprintln(os.Stderr, "nao consegui obter um token utilizavel para o comparador.")
 		fmt.Fprintln(os.Stderr, "Sem ele qualquer processo local compararia biometria em nome do sistema.")
-		registraErro("comparador: recusou subir sem COMPARADOR_TOKEN utilizavel")
+		registraErro("comparador: sem token utilizavel: %v", err)
 		return 1
 	}
 
@@ -80,6 +89,15 @@ func rodaComparador() int {
 		return 1
 	}
 
+	// Publica so agora: um anuncio gravado antes de a porta abrir mandaria os
+	// agentes para um endereco que ainda nao atende.
+	if err := publicaAnuncio(porta, segredo); err != nil {
+		registraErro("comparador: publicar anuncio: %v", err)
+	} else {
+		registraInfo("comparador: anunciado em %s", caminhoAnuncio())
+	}
+	defer removeAnuncio()
+
 	servidor := &http.Server{
 		Handler:           exigeSegredo(segredo, mux),
 		ReadHeaderTimeout: 5 * time.Second,
@@ -92,11 +110,41 @@ func rodaComparador() int {
 		BaseContext:    func(net.Listener) context.Context { return ctxApp },
 	}
 
+	// Serve nao retorna quando o contexto cai, entao o desligamento tem de ser
+	// pedido explicitamente. Sem isto o SCM esperaria o prazo de parada inteiro
+	// e mataria o processo, deixando o anuncio para tras.
+	go func() {
+		<-ctxApp.Done()
+		ctx, cancela := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancela()
+		if err := servidor.Shutdown(ctx); err != nil {
+			registraErro("comparador: desligar: %v", err)
+		}
+	}()
+
 	fmt.Println("comparador ouvindo em http://" + endereco)
-	if err := servidor.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		registraErro("comparador: servidor HTTP: %v", err)
+	registraInfo("comparador: ouvindo em %s", endereco)
+	if pronto != nil {
+		close(pronto)
+	}
+	erroServir := servidor.Serve(listener)
+
+	// Encerra o worker antes de sair. Sem isto ele sobrevive ao servico: fica
+	// orfao segurando o proprio executavel, e a atualizacao seguinte falha com
+	// "arquivo em uso" depois de o servico ja ter parado - ou seja, com o
+	// comparador fora do ar. Cada reinicio ainda deixaria mais um para tras.
+	//
+	// Contexto novo de proposito: ctxApp ja foi cancelado neste ponto, e
+	// naThreadSDK desiste de imediato com um contexto morto.
+	ctxSaida, cancelaSaida := context.WithTimeout(context.Background(), 10*time.Second)
+	encerraSDK(ctxSaida)
+	cancelaSaida()
+
+	if erroServir != nil && !errors.Is(erroServir, http.ErrServerClosed) {
+		registraErro("comparador: servidor HTTP: %v", erroServir)
 		return 1
 	}
+	registraInfo("comparador: encerrado")
 	return 0
 }
 

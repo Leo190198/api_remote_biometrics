@@ -94,18 +94,28 @@ máquinas é perda de tempo — foi o que custou duas rodadas de investigação.
 
 ## Ferramentas de diagnóstico criadas
 
-Todas continuam no binário e servem para o próximo problema de campo.
+| comando | o que responde | precisa de leitor? | ainda existe? |
+|---|---|---|---|
+| `--autoteste` | Caminho completo: captura, comparação direta e pelo worker | sim, 3 leituras | sim |
+| `--salvar-template <arq>` | Grava um template capturado em arquivo | sim | **não**, v1.2.0 |
+| `--conferir-template <arq>` | Compara um template com ele mesmo | **não** | **não**, v1.2.0 |
 
-| comando | o que responde | precisa de leitor? |
-|---|---|---|
-| `--autoteste` | Caminho completo: captura, comparação direta e pelo worker | sim, 3 leituras |
-| `--salvar-template <arq>` | Grava um template capturado em arquivo | sim |
-| `--conferir-template <arq>` | Compara um template com ele mesmo | **não** |
+O par `--salvar-template` / `--conferir-template` é o que separou extrator de
+comparador: levava-se um template de uma máquina sadia para a doente. Se passava
+lá, o comparador estava bom e o problema era a captura; se falhava, era o
+comparador. Sem isso, os dois sempre falham juntos e nada se distingue.
 
-O par `--salvar-template` / `--conferir-template` é o que separa extrator de
-comparador: leva-se um template de uma máquina sadia para a doente. Se ele passa
-lá, o comparador está bom e o problema é a captura; se falha, é o comparador.
-Sem isso, os dois sempre falham juntos e nada se distingue.
+**Os dois foram retirados do binário na v1.2.0**, depois que este diagnóstico
+fechou. `--salvar-template` era o único comando que gravava uma digital em
+arquivo desprotegido, e o agente passou a ser instalado em cinco servidores —
+não vale carregar essa capacidade em produção por uma pergunta já respondida.
+`--conferir-template` compara dentro do processo, exatamente o caminho que hoje
+se sabe corrompido dentro da sessão: o "falhou" dele virou o resultado esperado,
+e um teste cuja resposta já se conhece não diagnostica mais nada.
+
+Quem herdar um caso parecido usa `--teste-delegacao`, que faz a mesma comparação
+de um template com ele mesmo, mas pelo caminho de produção, e ainda diz se os
+módulos da FabulaTech estão dentro do processo.
 
 O que cada execução passou a registrar:
 
@@ -142,7 +152,7 @@ ou seja, não dá para tirar o agente do gancho por configuração.
 
 **2. Rodar o agente na workstation**, onde o leitor é físico e não há gancho.
 É o desenho original: serviço em localhost ao lado do hardware. `VerifyMatch`
-não precisa de leitor — comprovado, o `--conferir-template` roda sem hardware
+não precisa de leitor — comprovado, o `--conferir-template` rodava sem hardware
 nenhum. Fica pendente resolver como o navegador dentro da sessão RDP alcança o
 agente do lado cliente, que é questão de rede.
 
@@ -161,20 +171,33 @@ há caminho óbvio de texto para handle.
 
 ## Como reproduzir
 
-Na máquina com o problema, com o agente fechado:
+Este repro é o que foi rodado em julho de 2026, com um binário que ainda tinha
+`--conferir-template`:
 
 ```
 AgenteBiometria.exe --conferir-template <template-valido.txt>
 ```
 
 Um template válido é qualquer um capturado numa máquina onde
-`--conferir-template` devolve código 0. A saída lista a DLL, os módulos
+`--conferir-template` devolvia código 0. A saída lista a DLL, os módulos
 carregados com faixa de endereço e o veredito. Se aparecer `ftapihook32.dll` ou
 `ftfpstub.dll` na lista, é este caso.
 
 Códigos de saída: `0` passou, `1` o SDK recusou com erro tratado, `2` a DLL
 derrubou o processo (o Go imprime o traceback e o `PC` da falha, que se compara
 com as faixas dos módulos).
+
+**No binário atual**, o equivalente é, dentro da sessão RDP e com o serviço
+comparador no ar:
+
+```
+AgenteBiometria.exe --teste-delegacao
+```
+
+Ele imprime se o gancho está presente neste processo e compara um template com
+ele mesmo pelo caminho de produção. Com o desenho da v1.1.0 em diante, o
+esperado passou a ser `OK: conferiu` **mesmo com o gancho presente** — é
+justamente a prova de que a comparação saiu da jaula.
 
 ---
 

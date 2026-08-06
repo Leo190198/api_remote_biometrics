@@ -1,0 +1,139 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Instalador por maquina do Agente de Biometria.
+
+  Faz as tres coisas que um servidor RDS precisa:
+
+    1. instala o binario em Program Files (x86) - x86 porque a NBioBSP.dll so
+       existe em 32 bits;
+    2. registra o comparador como servico Windows, que roda em sessao 0 - a
+       unica onde o driver ftsjail.sys da FabulaTech nao injeta o gancho que
+       corrompe a comparacao (docs/diagnostico-verifymatch-rdp-2026-07-30.md);
+    3. poe o agente no logon de TODOS os usuarios, via HKLM\...\Run, para cada
+       sessao RDP ganhar o seu na bandeja.
+
+  Nao ha nada a configurar depois: o servico gera o proprio segredo e o publica
+  em ProgramData, e o agente de cada sessao le dali. Sem variavel de ambiente,
+  portanto sem depender de logoff para a sessao enxergar a mudanca.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
+
+  <Package
+      Name="Agente de Biometria"
+      Manufacturer="Sermed Saude"
+      Version="$(var.Versao)"
+      UpgradeCode="8f3c1a94-6d2e-4b7a-9c05-1e8b47d2f6a3"
+      Scope="perMachine"
+      Compressed="yes"
+      InstallerVersion="500">
+
+    <!-- Substitui a versao anterior antes de copiar a nova: com o servico e o
+         exe em uso, instalar por cima sem parar o antigo daria arquivo travado. -->
+    <MajorUpgrade
+        Schedule="afterInstallInitialize"
+        DowngradeErrorMessage="Ja existe uma versao mais nova do Agente de Biometria nesta maquina." />
+
+    <MediaTemplate EmbedCab="yes" />
+
+    <Launch
+        Condition="VersionNT64 OR VersionNT >= 603"
+        Message="Este instalador exige Windows 8.1/2012 R2 ou mais novo." />
+
+    <Icon Id="AppIcon" SourceFile="$(var.PastaFontes)\app.ico" />
+    <Property Id="ARPPRODUCTICON" Value="AppIcon" />
+    <Property Id="ARPNOREPAIR" Value="1" />
+
+    <Feature Id="Principal" Title="Agente de Biometria" Level="1">
+      <ComponentGroupRef Id="Componentes" />
+    </Feature>
+  </Package>
+
+  <Fragment>
+    <StandardDirectory Id="ProgramFilesFolder">
+      <Directory Id="PASTAINSTALACAO" Name="AgenteBiometria" />
+    </StandardDirectory>
+
+    <!-- ProgramData: onde o servico publica porta e token. A ACL herdada daqui
+         ja da leitura a Users e escrita so a SYSTEM e administradores, que e
+         exatamente a divisao entre quem le e quem escreve. -->
+    <StandardDirectory Id="CommonAppDataFolder">
+      <Directory Id="PASTADADOS" Name="AgenteBiometria" />
+    </StandardDirectory>
+
+    <ComponentGroup Id="Componentes">
+
+      <Component Id="CompAgente" Directory="PASTAINSTALACAO" Guid="*">
+        <File Id="AgenteBiometriaExe"
+              Source="$(var.PastaFontes)\AgenteBiometria.exe"
+              KeyPath="yes" />
+
+        <ServiceInstall
+            Id="ServicoComparador"
+            Name="AgenteBiometriaComparador"
+            DisplayName="Agente de Biometria - Comparador"
+            Description="Compara templates biometricos em sessao 0, fora do alcance do redirecionador de dispositivo que corrompe a comparacao dentro da sessao RDP."
+            Type="ownProcess"
+            Start="auto"
+            ErrorControl="normal"
+            Account="LocalSystem"
+            Arguments="--comparador"
+            Vital="yes">
+          <!-- Reinicio automatico: o comparador atende todas as sessoes do
+               servidor, entao ele parado significa biometria parada para todo
+               mundo, e ninguem estaria olhando o services.msc na hora. -->
+          <util:ServiceConfig
+              FirstFailureActionType="restart"
+              SecondFailureActionType="restart"
+              ThirdFailureActionType="restart"
+              RestartServiceDelayInSeconds="60"
+              ResetPeriodInDays="1" />
+        </ServiceInstall>
+
+        <ServiceControl
+            Id="ControleComparador"
+            Name="AgenteBiometriaComparador"
+            Start="install"
+            Stop="both"
+            Remove="uninstall"
+            Wait="yes" />
+      </Component>
+
+      <!-- Componente de 32 bits, como o resto do pacote, entao a chave real
+           gravada num Windows x64 e:
+             HKLM\SOFTWARE\Wow6432Node\Microsoft\Windows\CurrentVersion\Run
+           E onde se deve procurar ao conferir a mao. O Windows 64 bits processa
+           essa chave no logon junto com a nativa - e o caminho padrao de
+           aplicacao 32 bits. Marcar o componente como 64 bits nao e opcao: o
+           ICE80 recusa componente de 64 bits em pacote x86. -->
+      <Component Id="CompLogon" Directory="PASTAINSTALACAO" Guid="*">
+        <RegistryValue
+            Root="HKLM"
+            Key="SOFTWARE\Microsoft\Windows\CurrentVersion\Run"
+            Name="AgenteBiometria"
+            Type="string"
+            Value="&quot;[PASTAINSTALACAO]AgenteBiometria.exe&quot;"
+            KeyPath="yes" />
+      </Component>
+
+      <!-- O anuncio e criado em tempo de execucao, entao o MSI nao o conhece:
+           sem esta limpeza explicita ele sobreviveria a desinstalacao, e um
+           agente reinstalado depois tentaria falar com um servico que nao existe
+           mais. -->
+      <Component Id="CompDados" Directory="PASTADADOS" Guid="*">
+        <CreateFolder />
+        <RemoveFile Id="RemoveAnuncio" Name="comparador.json" On="uninstall" />
+        <RemoveFile Id="RemoveLogComparador" Name="comparador.log" On="uninstall" />
+        <RemoveFolder Id="RemovePastaDados" On="uninstall" />
+        <RegistryValue
+            Root="HKLM"
+            Key="SOFTWARE\Sermed\AgenteBiometria"
+            Name="PastaDados"
+            Type="string"
+            Value="[PASTADADOS]"
+            KeyPath="yes" />
+      </Component>
+
+    </ComponentGroup>
+  </Fragment>
+</Wix>

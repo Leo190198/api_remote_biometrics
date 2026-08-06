@@ -8,10 +8,22 @@
 /build-err.txt
 *.log
 
+# Saida do empacotamento MSI (WiX via NuGet).
+instalador/msi/bin/
+instalador/msi/obj/
+*.msi
+*.wixpdb
+
 # Dados locais gerados pelo agente
 # Templates biometricos NUNCA entram no repositorio: sao dado pessoal
-# irrevogavel, e este repositorio e publico.
+# irrevogavel, e este repositorio e publico. Senha trocada vaza uma vez; digital
+# vazada acompanha a pessoa pelo resto da vida.
 template*.txt
+# Arquivos de ambiente com template dentro (BIOMETRIA_*=...), do jeito que sai
+# do banco para um teste local.
+.env
+.env.*
+*.hash
 cert.pem
 key.pem
 agente-*.json

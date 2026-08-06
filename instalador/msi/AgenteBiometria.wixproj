@@ -1,0 +1,14 @@
+<Project Sdk="WixToolset.Sdk/4.0.5">
+  <PropertyGroup>
+    <OutputName>AgenteBiometria</OutputName>
+    <OutputType>Package</OutputType>
+    <!-- x86 porque o binario e windows/386: a NBioBSP.dll so existe em 32 bits.
+         Um pacote x64 instalaria em Program Files e confundiria o diagnostico. -->
+    <Platform>x86</Platform>
+    <DefineConstants>Versao=$(Versao);PastaFontes=$(PastaFontes)</DefineConstants>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="WixToolset.Util.wixext" Version="4.0.5" />
+  </ItemGroup>
+</Project>

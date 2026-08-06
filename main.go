@@ -451,6 +451,12 @@ func handleComparar(w http.ResponseWriter, r *http.Request) {
 		escreveErro(w, http.StatusBadGateway, err.Error())
 		return
 	}
+	// O log registrava o que chegou e nunca o veredito. So que "nao confere" e
+	// exatamente o sintoma que se investiga depois, quando a leitura ja passou e
+	// nao da para repetir: sem esta linha, um relato de campo nao tem como ser
+	// conferido contra o que a maquina realmente respondeu.
+	registraInfo("comparacao: benef=[%s] confere=%v",
+		impressaoTemplate(body.BiometriaBenef), ok)
 	escreveJSON(w, http.StatusOK, ok)
 }
 
@@ -556,6 +562,8 @@ func handleIdentificar(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ignorados = append(ignorados, res.ignorados...)
+	registraInfo("identificacao: %d candidatos, confere=%v id=%q ignorados=%d",
+		len(validos), res.id != "", res.id, len(ignorados))
 	if len(ignorados) > 0 && res.id == "" {
 		// Sem isso o sistema le "nao confere" e conclui que nao e a pessoa,
 		// quando na verdade o cadastro dela nao pode nem ser comparado.
@@ -842,21 +850,27 @@ func executa() int {
 	if len(os.Args) > 1 && os.Args[1] == "--autoteste" {
 		return rodaAutoteste()
 	}
-	if len(os.Args) > 2 && os.Args[1] == "--salvar-template" {
-		return salvaTemplate(os.Args[2])
-	}
-	if len(os.Args) > 2 && os.Args[1] == "--conferir-template" {
-		return confereTemplate(os.Args[2])
+	if len(os.Args) > 2 && os.Args[1] == "--conferir-contra" {
+		return confereContra(os.Args[2])
 	}
 	if len(os.Args) > 1 && os.Args[1] == "--teste-delegacao" {
 		return testeDelegacao()
 	}
-	// O worker herda BIO_FILHO do agente, entao precisa ser testado antes.
+	// O worker herda BIO_FILHO do agente, entao precisa ser testado antes. Ele
+	// tambem nasce de um processo nosso, nunca do SCM, entao passa reto pela
+	// deteccao de servico logo abaixo.
 	if os.Getenv("BIO_WORKER") == "1" {
 		return workerMain()
 	}
+	// Iniciado pelo Gerenciador de Servicos: so o comparador roda assim, e
+	// decidir pela origem do processo em vez dos argumentos evita depender de
+	// eles chegarem pelo ImagePath, que e detalhe do instalador.
+	if souServico() {
+		return rodaComoServico()
+	}
 	// O comparador vem antes do supervisor e da bandeja: e um servico de
-	// servidor, sem sessao Windows, sem leitor e sem interface.
+	// servidor, sem sessao Windows, sem leitor e sem interface. No terminal ele
+	// escreve na tela, o que mantem o --comparador util para diagnostico.
 	if os.Getenv("MODO_COMPARADOR") == "1" || (len(os.Args) > 1 && os.Args[1] == "--comparador") {
 		return rodaComparador()
 	}

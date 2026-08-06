@@ -269,18 +269,20 @@ de usá-los: dois processos disputando o mesmo leitor derrubam a captura.
 | Comando | O que faz | Precisa de leitor? |
 |---|---|---|
 | `--autoteste` | Exercita o caminho completo: captura, comparação direta e pelo worker. Grava relatório em `%LOCALAPPDATA%\BiometriaAgente\autoteste.log`. | Sim, 3 leituras |
-| `--salvar-template <arquivo>` | Captura uma digital e grava o template em arquivo. | Sim |
-| `--conferir-template <arquivo>` | Compara um template com ele mesmo. | **Não** |
+| `--teste-delegacao` | Captura na sessão e manda comparar no serviço comparador. Diz se o gancho da FabulaTech está neste processo. | Sim, 1 leitura |
+| `--conferir-contra <arquivo>` | Verificação 1:1: compara um cadastro guardado em arquivo com o dedo encostado agora. | Sim, 1 leitura |
 | `--gerar-cert` | Regenera o certificado local. | Não |
 
 Códigos de saída: `0` passou, `1` o SDK recusou com erro tratado, `2` a DLL
 derrubou o processo — nesse caso o traceback traz o endereço da falha, que se
-compara com as faixas dos módulos listados logo antes.
+compara com as faixas dos módulos listados logo antes. Em `--conferir-contra` o
+`2` tem outro sentido: **não confere**, que é resposta biométrica legítima e não
+falha. A distinção existe para um script nunca tratar "o comparador caiu" como
+"não é a pessoa".
 
-Os dois comandos de template juntos separam **extrator** de **comparador**:
-leve um template de uma máquina que funciona para a que falha. Se ele passar lá,
-o comparador está bom e o defeito é da captura; se falhar, é o comparador. Sem
-isso os dois sempre falham juntos e nada se distingue.
+`--teste-delegacao` é a verificação de aceite de cada servidor novo: comparar um
+template com ele mesmo tira a qualidade da leitura da conta, então um "não
+conferiu" ali só pode ser a comparação corrompida.
 
 Toda execução registra qual `NBioBSP.dll` foi aberta, com versão e tamanho, e a
 lista dos módulos nativos carregados no processo. Templates nunca aparecem nos
@@ -294,7 +296,7 @@ logs — só tamanho e um `sha256` curto.
 | Origem não autorizada | Abra o tray e aprove o endereço exibido em **Autorizar acesso**. |
 | Nenhum leitor detectado | Confira cabo, driver, redirecionamento RDP e arquitetura da DLL. |
 | `NBioBSP.dll nao encontrada` | Instale o SDK x86 ou configure `NBIOBSP_DLL`. |
-| `Template adulterado` (`0x000B`) ou queda no `VerifyMatch` | Rode `--conferir-template` com um template sabidamente válido. Se a lista de módulos trouxer `ftapihook32.dll` ou `ftfpstub.dll`, veja [docs/diagnostico-verifymatch-rdp-2026-07-30.md](docs/diagnostico-verifymatch-rdp-2026-07-30.md). |
+| `Template adulterado` (`0x000B`) ou queda no `VerifyMatch` | Rode `--teste-delegacao`. Se ele acusar `ftapihook32.dll` ou `ftfpstub.dll` no processo, a comparação tem de sair da sessão: veja [docs/diagnostico-verifymatch-rdp-2026-07-30.md](docs/diagnostico-verifymatch-rdp-2026-07-30.md). |
 | Token expirado | Execute novamente `Biometria.garantirConexao()`. |
 | Navegador bloqueou localhost | Use o sistema em HTTPS e conceda a permissão de rede local. |
 

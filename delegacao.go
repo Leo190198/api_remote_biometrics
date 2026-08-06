@@ -48,20 +48,39 @@ var comparadorRemoto *clienteComparador
 
 func configuraComparador() {
 	base := strings.TrimSpace(os.Getenv("COMPARADOR_URL"))
-	if base == "" {
-		return
+	token := os.Getenv("COMPARADOR_TOKEN")
+
+	// Sem as variaveis, procura o anuncio que o servico publica em ProgramData.
+	// E o caminho normal de uma instalacao pelo MSI: nada de ambiente de
+	// maquina, que uma sessao ja aberta nem enxergaria. Ausencia do arquivo
+	// significa que nao ha comparador nesta maquina, e ai comparar localmente e
+	// o comportamento certo, nao uma falha.
+	if base == "" || len(token) < 32 {
+		a, err := leAnuncio()
+		if err != nil {
+			if base != "" || token != "" {
+				registraErro("COMPARADOR_URL/TOKEN incompletos e sem anuncio utilizavel (%v): a comparacao continua local", err)
+			}
+			return
+		}
+		if base == "" {
+			base = a.Endereco
+		}
+		if len(token) < 32 {
+			token = a.Token
+		}
 	}
+
 	base = strings.TrimRight(base, "/")
 	endereco, err := url.Parse(base)
 	if err != nil || endereco.Host == "" || (endereco.Scheme != "http" && endereco.Scheme != "https") {
-		registraErro("COMPARADOR_URL invalida (%q): a comparacao continua local", base)
+		registraErro("endereco do comparador invalido (%q): a comparacao continua local", base)
 		return
 	}
 	// O mesmo minimo do lado do servico. Um token curto aqui so produziria 401
 	// em toda comparacao, e o motivo apareceria tarde, ja em producao.
-	token := os.Getenv("COMPARADOR_TOKEN")
 	if len(token) < 32 {
-		registraErro("COMPARADOR_TOKEN ausente ou curto demais: a comparacao continua local")
+		registraErro("token do comparador ausente ou curto demais: a comparacao continua local")
 		return
 	}
 	comparadorRemoto = &clienteComparador{
