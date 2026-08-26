@@ -4,6 +4,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -112,10 +113,31 @@ func gerarCert() error {
 	return nil
 }
 
+// prazoCertutil limita o certutil, que roda no caminho de subida do agente.
+//
+// Sem prazo, um certutil travado deixa o agente pendurado antes de a bandeja
+// aparecer: a porta ja esta aberta, nada atende, e o relato de campo e "o
+// agente nao abre" sem nenhuma pista no log. Num servidor RDP isso acontece por
+// usuario - trinta pessoas logando de manha sao trinta certutil simultaneos
+// contra o mesmo repositorio de certificados.
+//
+// Um minuto e folga larga de proposito. Desistir cedo trocaria HTTPS por HTTP
+// numa maquina que so estava lenta, e essa troca deve acontecer so quando o
+// certutil realmente nao vai responder.
+const prazoCertutil = time.Minute
+
 func instalaCertificadoUsuario(certPath string) error {
-	cmd := exec.Command("certutil.exe", "-user", "-addstore", "-f", "Root", certPath)
+	ctx, cancela := context.WithTimeout(context.Background(), prazoCertutil)
+	defer cancela()
+	cmd := exec.CommandContext(ctx, "certutil.exe", "-user", "-addstore", "-f", "Root", certPath)
 	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
 	saida, err := cmd.CombinedOutput()
+	// Checa o contexto antes do erro: um processo morto pelo prazo devolve
+	// "exit status 1", que mandaria quem le o log atras do certificado em vez
+	// do travamento.
+	if ctx.Err() != nil {
+		return fmt.Errorf("certutil nao respondeu em %s", prazoCertutil)
+	}
 	if err != nil {
 		return fmt.Errorf("certutil: %w: %s", err, string(saida))
 	}
