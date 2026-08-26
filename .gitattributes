@@ -1,0 +1,11 @@
+# O gofmt reprova CRLF, e o core.autocrlf=true que vem no Git for Windows
+# converte LF para CRLF no checkout. Sem esta linha, o passo de gofmt do CI
+# passa ou reprova conforme a configuracao da maquina que fez o checkout - e
+# nesta aqui ele reprova os 21 arquivos do repositorio.
+#
+# Os blobs ja estao gravados com LF: isto so fixa o que sai no checkout.
+*.go text eol=lf
+
+# Deliberadamente restrito aos .go. Uma regra ampla (* text=auto) renormalizaria
+# .cmd e .ps1, que no Windows precisam de CRLF, e isso e mexer em coisa que hoje
+# funciona.

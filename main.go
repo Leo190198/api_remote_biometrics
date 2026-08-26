@@ -69,7 +69,7 @@ var (
 	// os callbacks encontra systrayExit nulo e derruba o processo com panic em
 	// vez de encerrar a bandeja; este canal diz quando ja e seguro chamar.
 	bandejaPronta = make(chan struct{})
-	limiteHTTP = make(chan struct{}, maxRequisicoes)
+	limiteHTTP    = make(chan struct{}, maxRequisicoes)
 	// /identificar decodifica corpos de ate 16 MB e o pico do encoding/json
 	// chega a varias vezes isso. Com os 32 slots gerais de limiteHTTP, um
 	// punhado de requisicoes simultaneas estourava a memoria do processo.
