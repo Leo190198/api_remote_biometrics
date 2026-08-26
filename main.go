@@ -65,6 +65,10 @@ var (
 	origens    *gerenciadorOrigens
 	ctxApp     context.Context
 	cancelaApp context.CancelFunc
+	// Fechado por onReady. systray.Quit() antes de systray.Run() ter registrado
+	// os callbacks encontra systrayExit nulo e derruba o processo com panic em
+	// vez de encerrar a bandeja; este canal diz quando ja e seguro chamar.
+	bandejaPronta = make(chan struct{})
 	limiteHTTP = make(chan struct{}, maxRequisicoes)
 	// /identificar decodifica corpos de ate 16 MB e o pico do encoding/json
 	// chega a varias vezes isso. Com os 32 slots gerais de limiteHTTP, um
@@ -743,7 +747,29 @@ func gerenciaMenuOrigens(ctx context.Context, pai, revogar *systray.MenuItem) {
 	}
 }
 
+// encerraBandeja pede o fim da bandeja sem arriscar chamar systray.Quit()
+// antes de systray.Run(). Nesse intervalo o systray ainda tem systrayExit nulo
+// e a chamada vira panic numa goroutine sem recover, derrubando o agente
+// inteiro por uma falha que era para encerra-lo de forma ordenada.
+//
+// Quando a bandeja nem chega a subir, encerrar com codigo diferente de zero
+// mantem exatamente o que ja acontecia: o supervisor ve a saida suja e
+// reinicia. A diferenca e que agora isso e uma decisao registrada no log, e
+// nao o efeito colateral de um panic.
+func encerraBandeja() {
+	select {
+	case <-bandejaPronta:
+		systray.Quit()
+	case <-time.After(10 * time.Second):
+		registraErro("a bandeja nao subiu; encerrando o processo")
+		os.Exit(1)
+	}
+}
+
 func onReady() {
+	// Primeira coisa: onReady so e chamado depois de o systray registrar os
+	// callbacks, entao a partir daqui systray.Quit() e seguro.
+	close(bandejaPronta)
 	systray.SetIcon(iconeVermelho)
 	systray.SetTitle("")
 	systray.SetTooltip(fmt.Sprintf("Agente de Biometria - porta %d", porta))
@@ -941,7 +967,7 @@ func executa() int {
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			erroServidor <- err
 			registraErro("servidor HTTP: %v", err)
-			systray.Quit()
+			encerraBandeja()
 			return
 		}
 		erroServidor <- nil
