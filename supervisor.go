@@ -5,6 +5,7 @@ package main
 import (
 	"os"
 	"os/exec"
+	"runtime"
 	"syscall"
 	"time"
 	"unsafe"
@@ -20,6 +21,11 @@ func instanciaUnica() bool {
 		return false
 	}
 	h, _, errno := procCreateMutexW.Call(0, 0, uintptr(unsafe.Pointer(nome)))
+	// nome vira uintptr na linha acima, e a partir dai o coletor nao enxerga
+	// mais nenhuma referencia viva para ele. Sem este KeepAlive, o nome do
+	// mutex pode ser recolhido antes de a chamada terminar. E o mesmo cuidado
+	// que sdk.go ja documenta; aqui tinha passado batido.
+	runtime.KeepAlive(nome)
 	if h == 0 {
 		return false
 	}
