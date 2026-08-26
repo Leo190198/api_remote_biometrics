@@ -162,6 +162,10 @@ func executaOperacao(sdk *nbio, pedido pedidoWorker) (respostaWorker, error) {
 const (
 	falhasParaEsfriar = 3
 	esperaAposFalhas  = 5 * time.Second
+	// Dez segundos e folga larga para qualquer encerramento normal. Passou
+	// disso, o processo nao vai morrer tao cedo, e continuar esperando so troca
+	// "o leitor falhou" por "o agente nao responde mais".
+	prazoEncerrarWorker = 10 * time.Second
 )
 
 // clienteWorker implementa sdkAPI conversando com o processo worker. As
@@ -250,9 +254,28 @@ func (c *clienteWorker) derruba() string {
 	if c.cmd.Process != nil {
 		_ = c.cmd.Process.Kill()
 	}
+	// Wait com prazo. Kill e TerminateProcess, que normalmente retorna na hora,
+	// mas pode demorar quando a thread do worker esta presa dentro de uma
+	// chamada ao driver do leitor - cenario plausivel com o redirecionamento
+	// RDP oscilando. derruba roda com o mutex do cliente travado, entao um Wait
+	// sem teto congela todo o caminho do SDK junto, inclusive o encerramento.
+	//
+	// A goroutine continua viva depois do prazo e colhe o processo quando ele
+	// enfim morrer, entao nada vira zumbi.
+	cmd := c.cmd
+	terminou := make(chan error, 1)
+	go func() { terminou <- cmd.Wait() }()
+	prazo := time.NewTimer(prazoEncerrarWorker)
+	defer prazo.Stop()
 	saida := "saida limpa"
-	if err := c.cmd.Wait(); err != nil {
-		saida = err.Error()
+	select {
+	case err := <-terminou:
+		if err != nil {
+			saida = err.Error()
+		}
+	case <-prazo.C:
+		saida = fmt.Sprintf("nao encerrou em %s; seguindo sem esperar", prazoEncerrarWorker)
+		registraErro("worker do SDK %s", saida)
 	}
 	if c.leituraPai != nil {
 		_ = c.leituraPai.Close()
