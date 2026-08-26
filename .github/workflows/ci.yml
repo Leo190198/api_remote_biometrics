@@ -1,0 +1,115 @@
+# Portao automatico de qualidade.
+#
+# Todo arquivo deste repositorio traz "//go:build windows && 386" - a
+# NBioBSP.dll so existe em 32 bits. Isso quer dizer que num runner Linux, ou num
+# windows-latest sem GOARCH=386, o pacote inteiro fica VAZIO: "go build ./..."
+# passa sem compilar uma linha e "go test ./..." reporta "no test files". Um CI
+# assim e pior que nenhum, porque marca verde sem ter olhado o codigo.
+#
+# Por isso, alem de rodar em windows/386, o job confere que os testes de fato
+# rodaram (passo "os testes rodaram mesmo").
+name: CI
+
+on:
+  # Restrito as branches de integracao de proposito: com pull_request logo
+  # abaixo, um "branches: [**]" faria toda branch de PR rodar o job duas vezes.
+  push:
+    branches: [main, desenvolvimento]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows-386:
+    runs-on: windows-latest
+    env:
+      GOOS: windows
+      GOARCH: '386'
+      # A NBioBSP.dll e carregada em tempo de execucao por LoadLibrary, nunca
+      # ligada estaticamente: nada aqui precisa de cgo, e desligar evita
+      # depender do gcc de 32 bits do runner.
+      CGO_ENABLED: '0'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # Depende de .gitattributes fixar LF nos .go. Sem aquilo, o
+      # core.autocrlf=true do Git for Windows entrega o checkout em CRLF e este
+      # passo reprova todos os arquivos do repositorio.
+      - name: gofmt
+        shell: bash
+        run: |
+          fora=$(gofmt -l .)
+          if [ -n "$fora" ]; then
+            echo "Arquivos fora do gofmt:"
+            echo "$fora"
+            exit 1
+          fi
+
+      - name: go build
+        run: go build ./...
+
+      - name: go vet
+        run: go vet ./...
+
+      # shell: bash de proposito. No PowerShell do runner, "2>&1" sobre um
+      # executavel nativo transforma cada linha de stderr em ErrorRecord, e o
+      # wrapper do Actions roda com $ErrorActionPreference='Stop' - o go manda
+      # bastante coisa normal por stderr, e o passo falharia com o teste verde.
+      #
+      # -count=1 para o cache de teste do Go nao devolver um resultado antigo
+      # como se tivesse rodado agora.
+      - name: go test
+        shell: bash
+        run: go test -count=1 ./... 2>&1 | tee resultado-teste.txt
+
+      - name: os testes rodaram mesmo
+        shell: bash
+        run: |
+          # A build tag windows && 386 faz um alvo errado produzir pacote vazio,
+          # e pacote vazio passa em tudo. Este passo e o que separa "verde
+          # porque passou" de "verde porque nao olhou".
+          #
+          # A mensagem muda conforme a versao do Go: ate certo ponto era "no
+          # test files", e no Go 1.26 um alvo errado da "matched no packages".
+          # Cobrir as duas evita que a trava caduque numa atualizacao de
+          # toolchain sem ninguem perceber.
+          if grep -qE "no test files|matched no packages" resultado-teste.txt; then
+            echo "Pacote sem testes: a build tag windows && 386 nao casou com o alvo."
+            cat resultado-teste.txt
+            exit 1
+          fi
+          # Rede de baixo: mesmo que a mensagem mude de novo, um alvo errado
+          # nunca produz uma linha "ok". Foi esta metade que pegou o caso do
+          # Go 1.26 quando a de cima ja nao pegava.
+          grep -qE "^ok\s" resultado-teste.txt || {
+            echo "Nenhum pacote reportou ok."
+            cat resultado-teste.txt
+            exit 1
+          }
+
+      # O que a instalacao entrega de verdade: exe com -H windowsgui (sem
+      # console piscando no logon) para windows/386. O icone nao e embutido aqui
+      # - isso e passo do release, feito pelo embutir-icone.py.
+      - name: binario de release
+        run: >
+          go build -trimpath -ldflags "-s -w -H windowsgui
+          -X main.versao=ci -X main.commit=${{ github.sha }}"
+          -o AgenteBiometria.exe .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AgenteBiometria-386
+          path: AgenteBiometria.exe
+          retention-days: 7
