@@ -221,6 +221,20 @@ Com exceção de `/api/hello`, as rotas exigem o token da sessão no cabeçalho 
 
 O curinga `*` não é aceito em `CORS_ORIGEM`.
 
+`SISTEMA_URL` e `CORS_ORIGEM` são perguntadas pelo **MSI durante a instalação**,
+numa tela só, e gravadas como variáveis de ambiente **da máquina** — valem para
+todos os usuários do servidor. Os campos vêm em branco; deixar em branco não
+grava a variável. Para instalar sem interface:
+
+```
+msiexec /i AgenteBiometria.msi /qn SISTEMA_URL="https://sistema.exemplo:8081"
+```
+
+**Variável de máquina só é vista por sessão aberta depois da instalação.** Quem
+já estava logado precisa sair e entrar para o agente dele receber a origem — o
+que de todo modo é necessário para o agente trocar de versão, já que ele sobe
+pelo `HKLM\...\Run` no logon.
+
 ## Segurança
 
 - O listener abre exclusivamente em `127.0.0.1`.

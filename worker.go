@@ -161,12 +161,43 @@ func executaOperacao(sdk *nbio, pedido pedidoWorker) (respostaWorker, error) {
 
 const (
 	falhasParaEsfriar = 3
-	esperaAposFalhas  = 5 * time.Second
 	// Dez segundos e folga larga para qualquer encerramento normal. Passou
 	// disso, o processo nao vai morrer tao cedo, e continuar esperando so troca
 	// "o leitor falhou" por "o agente nao responde mais".
 	prazoEncerrarWorker = 10 * time.Second
 )
+
+// prazoOciosidade solta o worker quando ninguem esta usando o leitor.
+//
+// Ate a v1.2.0 o worker subia junto com a sondagem da bandeja e ficava
+// residente para sempre, com a NBioBSP.dll carregada dentro da jaula do
+// ftsjail.sys. Num servidor RDP isso eram ~32 processos parados segurando o SDK
+// sem ninguem pedir nada. Recriar custa um spawn de alguns milissegundos, que
+// so aparece na primeira leitura depois de uma pausa.
+//
+// Variavel, e nao constante, para o teste poder encurtar o prazo.
+var prazoOciosidade = 5 * time.Minute
+
+// esperasAposFalhas escalona o recuo depois de falhas seguidas.
+//
+// A espera antiga era fixa em 5 s, contra um ciclo de falha de 20 s (o prazo do
+// "contar"). Como os 5 s ja tinham passado quando a proxima tentativa chegava,
+// o disjuntor so inseria o intervalo do ticker: a cadencia ia de 20 s para
+// 35 s e nunca parava. Foi assim que se formou, em producao, uma sequencia de
+// 94 travamentos seguidos - cada um deles um TerminateProcess sobre uma thread
+// presa dentro do driver do leitor.
+var esperasAposFalhas = []time.Duration{30 * time.Second, 2 * time.Minute, 10 * time.Minute}
+
+func esperaAposFalhas(falhas int) time.Duration {
+	i := falhas - falhasParaEsfriar
+	if i < 0 {
+		i = 0
+	}
+	if i >= len(esperasAposFalhas) {
+		i = len(esperasAposFalhas) - 1
+	}
+	return esperasAposFalhas[i]
+}
 
 // clienteWorker implementa sdkAPI conversando com o processo worker. As
 // chamadas ja chegam serializadas pela goroutine do SDK; o mutex cobre apenas
@@ -183,6 +214,11 @@ type clienteWorker struct {
 
 	falhasSeguidas int
 	ultimaFalha    time.Time
+
+	// ocioso encerra o worker quando ele fica sem uso. Timer em vez de
+	// goroutine permanente: nao precisa de contexto para morrer nem de um
+	// canal de parada.
+	ocioso *time.Timer
 }
 
 func novoClienteWorker(dll string) (sdkAPI, error) {
@@ -199,8 +235,11 @@ func (c *clienteWorker) sobe() error {
 	// Se a DLL derruba o worker de forma deterministica (um template
 	// corrompido reenviado a cada tentativa), subir um processo novo por
 	// requisicao so troca o crash por uma tempestade de spawns.
-	if c.falhasSeguidas >= falhasParaEsfriar && time.Since(c.ultimaFalha) < esperaAposFalhas {
-		return errors.New("o leitor biometrico falhou varias vezes seguidas; aguarde alguns segundos")
+	if c.falhasSeguidas >= falhasParaEsfriar {
+		if espera := esperaAposFalhas(c.falhasSeguidas); time.Since(c.ultimaFalha) < espera {
+			return fmt.Errorf("o leitor biometrico falhou %d vezes seguidas; aguarde %s",
+				c.falhasSeguidas, espera)
+		}
 	}
 	exe, err := os.Executable()
 	if err != nil {
@@ -295,6 +334,9 @@ func (c *clienteWorker) envia(pedido pedidoWorker, limite time.Duration) (respos
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	// Registrado depois do Unlock, entao roda antes dele: o timer e rearmado
+	// com o mutex ainda na mao, sem disputar com quem esta encerrando.
+	defer c.armaOciosidade()
 	if err := c.sobe(); err != nil {
 		return respostaWorker{}, err
 	}
@@ -368,9 +410,38 @@ func (c *clienteWorker) identifica(lida string, candidatos []candidatoJSON) (str
 	return r.ID, r.Ignorados, err
 }
 
+// armaOciosidade adia o encerramento automatico. Exige c.mu travado.
+func (c *clienteWorker) armaOciosidade() {
+	if c.ocioso == nil {
+		c.ocioso = time.AfterFunc(prazoOciosidade, c.soltaPorOciosidade)
+		return
+	}
+	c.ocioso.Reset(prazoOciosidade)
+}
+
+// soltaPorOciosidade encerra o worker parado, para que uma sessao sem uso nao
+// fique segurando a NBioBSP.dll carregada.
+func (c *clienteWorker) soltaPorOciosidade() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.cmd == nil {
+		return
+	}
+	registraInfo("worker do SDK ocioso ha %s; encerrando ate alguem precisar", prazoOciosidade)
+	_ = c.encerraTravado()
+}
+
 func (c *clienteWorker) encerra() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	return c.encerraTravado()
+}
+
+// encerraTravado e o encerramento propriamente dito. Exige c.mu travado.
+func (c *clienteWorker) encerraTravado() error {
+	if c.ocioso != nil {
+		c.ocioso.Stop()
+	}
 	if c.cmd == nil {
 		return nil
 	}

@@ -64,6 +64,21 @@ func rodaComparadorCom(pronto chan<- struct{}) int {
 	defer cancelaApp()
 
 	registraInfo("comparador: iniciando versao=%s commit=%s porta=%d", versao, commit, porta)
+
+	// O certificado de maquina e responsabilidade deste servico. Ele roda como
+	// SYSTEM, que e o unico contexto onde o registro na loja Root sai
+	// silencioso, e sobe a cada boot - o que faz a renovacao acontecer sozinha,
+	// sem depender de reinstalar o pacote quando o certificado vencer.
+	//
+	// Falhar aqui nao derruba o servico: comparar nao depende de TLS, e um
+	// comparador fora do ar custa a conferencia de todo mundo.
+	if err := garanteCertificadoMaquina(); err != nil {
+		registraErro("comparador: certificado da maquina: %v", err)
+	} else {
+		cert, _ := caminhosCertMaquina()
+		registraInfo("comparador: certificado da maquina em %s", cert)
+	}
+
 	defineDLL(achaDLL())
 	registraInfo("comparador: DLL %s", descreveDLL(caminhoDLL()))
 	for _, m := range modulosBiometricos() {

@@ -324,6 +324,7 @@ func handleStatus(w http.ResponseWriter, r *http.Request) {
 		}
 		return s.contaDispositivos()
 	})
+	anotaContagemLeitor(n, err)
 	info := map[string]any{
 		"dll": dllOuNada(), "arch": "386", "https": usaTLS,
 		"versao": versao, "commit": commit,
@@ -373,6 +374,7 @@ func capturaEResponde(w http.ResponseWriter, r *http.Request, purpose uint16, ti
 		}
 		return s.capturaTexto(purpose, timeout)
 	})
+	anotaCapturaLeitor(err)
 	if err != nil || template == "" {
 		if err == nil {
 			err = errors.New("SDK devolveu template vazio")
@@ -773,7 +775,7 @@ func onReady() {
 	systray.SetIcon(iconeVermelho)
 	systray.SetTitle("")
 	systray.SetTooltip(fmt.Sprintf("Agente de Biometria - porta %d", porta))
-	go monitorLeitor(ctxApp)
+	go checaLeitorNoArranque(ctxApp)
 
 	var abrir *systray.MenuItem
 	if urlSistema() != "" {
@@ -820,35 +822,117 @@ func onReady() {
 	}()
 }
 
-func monitorLeitor(ctx context.Context) {
-	// NBioAPI_EnumerateDevice devolve uma lista que o SDK aloca e nao expoe
-	// funcao para liberar. A cada 5 segundos eram ~17 mil chamadas por dia,
-	// suficiente para um vazamento pequeno virar falta de memoria num processo
-	// de 32 bits. 15 segundos ainda detecta o leitor rapido o bastante.
-	ticker := time.NewTicker(15 * time.Second)
-	defer ticker.Stop()
-	for {
-		conectado, err := naThreadSDK(ctx, func() (bool, error) {
-			s, err := ensureSDK()
-			if err != nil {
-				return false, err
-			}
-			n, err := s.contaDispositivos()
-			return n > 0, err
-		})
-		if err == nil && conectado {
-			systray.SetIcon(iconeVerde)
-			systray.SetTooltip(fmt.Sprintf("Biometria - leitor conectado - porta %d", porta))
-		} else {
-			systray.SetIcon(iconeVermelho)
-			systray.SetTooltip(fmt.Sprintf("Biometria - sem leitor - porta %d", porta))
-		}
-		select {
-		case <-ticker.C:
-		case <-ctx.Done():
-			return
-		}
+// O estado do leitor deixou de ser sondado.
+//
+// Ate a v1.2.0 uma goroutine chamava NBioAPI_EnumerateDevice a cada 15 s, para
+// sempre, so para escolher a cor do icone. Num servidor RDP isso e devastador:
+// medido em producao ao longo de tres semanas, foram 996 travamentos de mais de
+// 20 s e 267 mortes do worker, **todos** nessa sondagem, contra ~22 operacoes
+// biometricas de verdade no mesmo periodo. Cada travamento terminava num
+// TerminateProcess sobre uma thread presa dentro do driver do leitor, e o
+// proximo tique subia outro processo que recarregava a DLL. Os travamentos do
+// ERP na mesma maquina caem em cima dessas tempestades: 8 dos 13 eventos a
+// menos de 90 s de um deles, numa base em que essas janelas cobrem 4,6% do
+// tempo.
+//
+// O ERP fala com a NBioBSP.dll direto, sem passar por aqui, entao os dois
+// disputavam o mesmo leitor redirecionado sem qualquer coordenacao — e tudo o
+// que o agente punha nessa disputa era sobrecarga.
+//
+// A regra agora e simples e verificavel: o agente so toca no leitor quando
+// alguem pede, com uma unica excecao — a checagem de arranque abaixo.
+var (
+	leitorMu        sync.Mutex
+	leitorConectado bool
+	leitorAferido   bool
+)
+
+// janelaChecagemInicial e o quanto a checagem de arranque pode ser adiada.
+//
+// Trinta sessoes RDP sobem no mesmo minuto de manha. Se todas sondarem o leitor
+// no mesmo instante, trocamos a tempestade continua por uma concentrada.
+const janelaChecagemInicial = 30 * time.Second
+
+// checaLeitorNoArranque faz a unica sondagem que o agente inicia por conta
+// propria, para o icone ja nascer dizendo alguma coisa.
+func checaLeitorNoArranque(ctx context.Context) {
+	// O atraso sai da porta, e nao de um sorteio: cada sessao recebe uma porta
+	// distinta da faixa 5000-5099, entao isso ja espalha as sessoes de forma
+	// deterministica, sem sortear nada e sem importar math/rand ao lado do
+	// crypto/rand que este arquivo ja usa.
+	espera := time.Duration(porta%100) * janelaChecagemInicial / 100
+	select {
+	case <-time.After(espera):
+	case <-ctx.Done():
+		return
 	}
+	n, err := naThreadSDK(ctx, func() (uint32, error) {
+		s, err := ensureSDK()
+		if err != nil {
+			return 0, err
+		}
+		return s.contaDispositivos()
+	})
+	if err != nil {
+		registraErro("checagem inicial do leitor: %v", err)
+	}
+	anotaContagemLeitor(n, err)
+}
+
+// anotaContagemLeitor registra o desfecho de uma contagem de dispositivos.
+func anotaContagemLeitor(n uint32, err error) {
+	if err == nil {
+		defineEstadoLeitor(n > 0)
+		return
+	}
+	if erroDeDispositivo(err) {
+		defineEstadoLeitor(false)
+	}
+}
+
+// anotaCapturaLeitor registra o desfecho de uma captura.
+//
+// Erro que nao e de dispositivo nao mexe no icone. Dedo falso (0x0204), tempo
+// esgotado (0x0203) e captura cancelada (0x0201) sao desfechos normais de uso:
+// pintar de vermelho ali diria "sem leitor" para quem acabou de usar o leitor.
+func anotaCapturaLeitor(err error) {
+	if err == nil {
+		defineEstadoLeitor(true)
+		return
+	}
+	if erroDeDispositivo(err) {
+		defineEstadoLeitor(false)
+	}
+}
+
+func defineEstadoLeitor(conectado bool) {
+	leitorMu.Lock()
+	mudou := !leitorAferido || leitorConectado != conectado
+	leitorConectado, leitorAferido = conectado, true
+	leitorMu.Unlock()
+	if mudou {
+		pintaIconeLeitor(conectado)
+	}
+}
+
+// pintaIconeLeitor so fala com a bandeja depois que ela subiu.
+//
+// As anotacoes vem dos handlers HTTP, que rodam bem antes disso em teste e
+// podem rodar antes em producao. Chamar systray.SetIcon com o systray ainda sem
+// callbacks registrados e o mesmo risco que encerraBandeja ja evita.
+func pintaIconeLeitor(conectado bool) {
+	select {
+	case <-bandejaPronta:
+	default:
+		return
+	}
+	if conectado {
+		systray.SetIcon(iconeVerde)
+		systray.SetTooltip(fmt.Sprintf("Biometria - leitor conectado - porta %d", porta))
+		return
+	}
+	systray.SetIcon(iconeVermelho)
+	systray.SetTooltip(fmt.Sprintf("Biometria - sem leitor - porta %d", porta))
 }
 
 func encerraSDK(ctx context.Context) {
@@ -869,6 +953,15 @@ func executa() int {
 	if len(os.Args) > 1 && os.Args[1] == "--gerar-cert" {
 		if err := gerarCert(); err != nil {
 			fmt.Fprintln(os.Stderr, "gerar-cert:", err)
+			return 1
+		}
+		return 0
+	}
+	// Chamado pela desinstalacao, como SYSTEM. Vem antes do autoteste porque
+	// nao depende de nada do agente estar de pe.
+	if len(os.Args) > 1 && os.Args[1] == "--remover-cert-maquina" {
+		if err := removeCertificadoMaquina(); err != nil {
+			fmt.Fprintln(os.Stderr, "remover-cert-maquina:", err)
 			return 1
 		}
 		return 0

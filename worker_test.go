@@ -273,3 +273,67 @@ func TestNaThreadSDKIgnoraTarefaCancelada(t *testing.T) {
 		t.Fatal("tarefa cancelada rodou mesmo assim")
 	}
 }
+
+// O recuo tem de crescer. A espera antiga era fixa em 5 s contra um ciclo de
+// falha de 20 s: quando a proxima tentativa chegava, os 5 s ja tinham passado e
+// o disjuntor nunca segurava nada. Foi assim que se formou a sequencia de 94
+// travamentos seguidos medida em producao.
+func TestRecuoAposFalhasEscalonaESatura(t *testing.T) {
+	primeira := esperaAposFalhas(falhasParaEsfriar)
+	if primeira < 20*time.Second {
+		t.Fatalf("primeira espera = %s; precisa ser maior que o ciclo de falha", primeira)
+	}
+	anterior := primeira
+	for falhas := falhasParaEsfriar + 1; falhas < falhasParaEsfriar+len(esperasAposFalhas); falhas++ {
+		atual := esperaAposFalhas(falhas)
+		if atual <= anterior {
+			t.Fatalf("espera com %d falhas = %s; nao cresceu sobre %s", falhas, atual, anterior)
+		}
+		anterior = atual
+	}
+	// Satura em vez de estourar o indice.
+	if teto := esperaAposFalhas(falhasParaEsfriar + 999); teto != anterior {
+		t.Fatalf("teto = %s; queria saturar em %s", teto, anterior)
+	}
+	// Menos falhas que o limite nao consulta indice negativo.
+	if espera := esperaAposFalhas(0); espera != esperasAposFalhas[0] {
+		t.Fatalf("espera com 0 falhas = %s", espera)
+	}
+}
+
+// Sessao sem uso nao pode ficar segurando a NBioBSP.dll carregada dentro da
+// jaula do ftsjail.sys. Eram ~32 processos assim por servidor.
+func TestWorkerOciosoEEncerradoERecriadoNoUsoSeguinte(t *testing.T) {
+	anterior := prazoOciosidade
+	prazoOciosidade = 50 * time.Millisecond
+	t.Cleanup(func() { prazoOciosidade = anterior })
+
+	c := clienteDeTeste(t, "eco")
+	if _, err := c.contaDispositivos(); err != nil {
+		t.Fatalf("contaDispositivos: %v", err)
+	}
+	if c.cmd == nil {
+		t.Fatal("worker deveria estar de pe logo apos o uso")
+	}
+
+	prazo := time.After(5 * time.Second)
+	for {
+		c.mu.Lock()
+		vivo := c.cmd != nil
+		c.mu.Unlock()
+		if !vivo {
+			break
+		}
+		select {
+		case <-prazo:
+			t.Fatal("worker ocioso nao foi encerrado")
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+
+	// E o uso seguinte tem de recria-lo sem que o chamador perceba.
+	n, err := c.contaDispositivos()
+	if err != nil || n != 2 {
+		t.Fatalf("contaDispositivos apos ociosidade = %d, %v; queria 2, nil", n, err)
+	}
+}

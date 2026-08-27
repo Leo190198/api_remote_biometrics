@@ -8,6 +8,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/sha1"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
@@ -26,6 +27,17 @@ import (
 
 func caminhosCert() (cert, key string) {
 	dir := diretorioDados()
+	return filepath.Join(dir, "cert.pem"), filepath.Join(dir, "key.pem")
+}
+
+// caminhosCertMaquina aponta para o certificado unico da maquina, ao lado do
+// anuncio do comparador em ProgramData.
+//
+// E o mesmo diretorio de onde todo agente de sessao ja le o comparador.json
+// com o token do servico, entao a ACL necessaria (Users: leitura) esta provada
+// em producao por aquele arquivo.
+func caminhosCertMaquina() (cert, key string) {
+	dir := diretorioCompartilhado()
 	return filepath.Join(dir, "cert.pem"), filepath.Join(dir, "key.pem")
 }
 
@@ -144,11 +156,148 @@ func instalaCertificadoUsuario(certPath string) error {
 	return nil
 }
 
+// instalaCertificadoMaquina registra o certificado na loja Root da maquina.
+//
+// Sem "-user", ao contrario do caminho do usuario. Essa e a diferenca que
+// resolve o problema: adicionar a loja Root **do usuario** sempre abre o aviso
+// de seguranca do Windows, e nao existe forma silenciosa de faze-lo - e por
+// design. Na loja da maquina, com processo elevado, o registro e silencioso.
+// Foi por isso que o caminho antigo acumulou 226 recusas em producao: os
+// usuarios negavam um dialogo que aparecia a cada logon.
+func instalaCertificadoMaquina(certPath string) error {
+	ctx, cancela := context.WithTimeout(context.Background(), prazoCertutil)
+	defer cancela()
+	cmd := exec.CommandContext(ctx, "certutil.exe", "-addstore", "-f", "Root", certPath)
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+	saida, err := cmd.CombinedOutput()
+	if ctx.Err() != nil {
+		return fmt.Errorf("certutil nao respondeu em %s", prazoCertutil)
+	}
+	if err != nil {
+		return fmt.Errorf("certutil: %w: %s", err, string(saida))
+	}
+	return nil
+}
+
+// garanteCertificadoMaquina gera e registra o certificado da maquina, criando
+// um novo quando o atual esta perto de vencer. Quem chama e o servico
+// comparador, que roda como SYSTEM e sobe a cada boot - e por isso a renovacao
+// acontece sozinha, sem depender de reinstalar o pacote daqui a dois anos.
+func garanteCertificadoMaquina() error {
+	certPath, keyPath := caminhosCertMaquina()
+	agora := time.Now()
+	if certificadoValido(certPath, keyPath, agora) == nil {
+		return nil
+	}
+	certPEM, keyPEM, err := materialCertificado(agora)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(certPath), 0o755); err != nil {
+		return fmt.Errorf("criar diretorio compartilhado: %w", err)
+	}
+	// 0o644, e nao 0o600 como no certificado do usuario: aqui a chave precisa
+	// ser legivel por todo agente de sessao. E a contrapartida aceita deste
+	// desenho - a defesa contra um agente impostor de outra sessao continua
+	// sendo mesmaSessao() mais o token, nao o TLS.
+	if err := gravaArquivoAtomico(keyPath, keyPEM, 0o644); err != nil {
+		return fmt.Errorf("gravar chave da maquina: %w", err)
+	}
+	if err := gravaArquivoAtomico(certPath, certPEM, 0o644); err != nil {
+		return fmt.Errorf("gravar certificado da maquina: %w", err)
+	}
+	if err := certificadoValido(certPath, keyPath, agora); err != nil {
+		return err
+	}
+	return instalaCertificadoMaquina(certPath)
+}
+
+// impressaoDigital devolve o thumbprint SHA-1 do certificado, que e como o
+// Windows indexa a loja e o que o certutil aceita para apagar um registro
+// especifico. Nao e escolha de seguranca: e o identificador do repositorio.
+func impressaoDigital(der []byte) string {
+	soma := sha1.Sum(der)
+	return fmt.Sprintf("%x", soma)
+}
+
+// removeCertificadoMaquina desfaz o que garanteCertificadoMaquina fez.
+//
+// Sem isto, desinstalar o agente deixava uma raiz confiavel orfa na maquina —
+// exatamente o que o instalar-servidor.ps1 hoje assume ao dizer que preserva o
+// certificado de cada usuario. Raiz confiavel que ninguem sabe de onde veio nao
+// deve sobreviver a desinstalacao.
+func removeCertificadoMaquina() error {
+	certPath, keyPath := caminhosCertMaquina()
+	dados, err := os.ReadFile(certPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	bloco, _ := pem.Decode(dados)
+	if bloco == nil || bloco.Type != "CERTIFICATE" {
+		return errors.New("certificado da maquina ilegivel")
+	}
+
+	ctx, cancela := context.WithTimeout(context.Background(), prazoCertutil)
+	defer cancela()
+	cmd := exec.CommandContext(ctx, "certutil.exe", "-delstore", "Root", impressaoDigital(bloco.Bytes))
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+	saida, erroCertutil := cmd.CombinedOutput()
+
+	// Os arquivos saem mesmo se o certutil falhar: deixar a chave privada para
+	// tras seria pior do que deixar o registro na loja, e o registro sem a
+	// chave correspondente nao serve para nada.
+	if err := os.Remove(keyPath); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	if err := os.Remove(certPath); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	if ctx.Err() != nil {
+		return fmt.Errorf("certutil nao respondeu em %s", prazoCertutil)
+	}
+	if erroCertutil != nil {
+		return fmt.Errorf("certutil: %w: %s", erroCertutil, string(saida))
+	}
+	return nil
+}
+
+func configuracaoTLS(cert tls.Certificate) *tls.Config {
+	return &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		MinVersion:   tls.VersionTLS12,
+	}
+}
+
 func carregaTLS() (*tls.Config, error) {
+	certPath, keyPath := caminhosCertMaquina()
+	if certificadoValido(certPath, keyPath, time.Now()) == nil {
+		cert, err := tls.LoadX509KeyPair(certPath, keyPath)
+		if err == nil {
+			registraInfo("TLS: certificado de maquina em %s", certPath)
+			return configuracaoTLS(cert), nil
+		}
+		registraErro("certificado de maquina ilegivel: %v", err)
+	}
+
+	// Onde existe comparador, o certificado da maquina e responsabilidade dele.
+	// Cair no caminho do usuario aqui traria de volta o dialogo no logon, que e
+	// justamente o defeito que este desenho remove. Melhor servir HTTP: o
+	// proprio integra-biometria.js ja tenta os dois protocolos, e Chrome, Edge
+	// e Firefox aceitam http://localhost a partir de pagina https.
+	if _, err := leAnuncio(); err == nil {
+		return nil, errors.New("certificado da maquina ainda nao publicado pelo comparador")
+	}
+
+	// Estacao de trabalho, sem servico: continua como sempre foi. Ali o
+	// certificado e do proprio usuario, o dialogo aparece uma vez e quem
+	// responde e o dono da maquina.
 	if err := gerarCert(); err != nil {
 		return nil, err
 	}
-	certPath, keyPath := caminhosCert()
+	certPath, keyPath = caminhosCert()
 	if err := instalaCertificadoUsuario(certPath); err != nil {
 		return nil, err
 	}
@@ -156,10 +305,7 @@ func carregaTLS() (*tls.Config, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &tls.Config{
-		Certificates: []tls.Certificate{cert},
-		MinVersion:   tls.VersionTLS12,
-	}, nil
+	return configuracaoTLS(cert), nil
 }
 
 type connEspiada struct {

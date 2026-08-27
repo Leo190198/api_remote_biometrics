@@ -88,14 +88,71 @@ O agente aceita **HTTP e HTTPS na mesma porta**. O script escolhe sozinho:
 página `https://` fala `https://localhost:PORTA`; página `http://` fala
 `http://localhost:PORTA` (com fallback para o outro protocolo).
 
-Para o HTTPS funcionar, o **instalador do servidor** gera um certificado
-autoassinado de `localhost` e o registra na loja de raízes confiáveis da
-máquina (veja `agente-go/instalador/instalar-servidor.ps1`). Sem o
-certificado, o agente segue só em HTTP — o que Chrome/Edge/Firefox ainda
-aceitam a partir de páginas https (exceção de conteúdo misto para
+Para o HTTPS funcionar é preciso um certificado autoassinado de `localhost`
+registrado na loja de raízes confiáveis. Quem cuida disso é o **serviço
+comparador**: ele roda como SYSTEM — o único contexto em que registrar na loja
+**da máquina** é silencioso — e confere o certificado a cada partida, então a
+renovação acontece sozinha. O par fica em `C:\ProgramData\AgenteBiometria\`,
+ao lado do `comparador.json`, e todo agente de sessão lê dali.
+
+Numa estação de trabalho sem o serviço, o agente gera o certificado do próprio
+usuário e pede para instalá-lo — o Windows exibe um aviso de segurança, que o
+dono da máquina responde uma vez.
+
+**O agente nunca pede isso num servidor com o comparador instalado.** Adicionar
+à loja Root **do usuário** sempre abre esse diálogo, e não existe forma
+silenciosa de fazê-lo; num servidor RDP isso significava um aviso por usuário a
+cada logon, que as pessoas negavam por não saber do que se tratava. Onde há
+comparador e o certificado da máquina ainda não foi publicado, o agente segue
+em HTTP em silêncio.
+
+Sem certificado nenhum, o agente segue só em HTTP — o que Chrome/Edge/Firefox
+ainda aceitam a partir de páginas https (exceção de conteúdo misto para
 `localhost`); só o Safari bloqueia.
 
+## O ícone da bandeja
+
+Verde é leitor presente, vermelho é sem leitor. O agente confere **uma vez ao
+iniciar** e, daí em diante, o ícone reflete o resultado da última operação real
+(`/api/status` ou uma captura).
+
+Ele **não fica sondando o leitor**. Até a v1.2.0 sondava a cada 15 segundos, e
+num servidor RDP isso disputava o leitor com quem estivesse usando — inclusive
+com outro programa que fale direto com a `NBioBSP.dll`. Se o ícone estiver
+desatualizado, `GET /api/status` o atualiza na hora.
+
 ## Instalação no servidor (todos os usuários)
+
+### Pelo MSI (recomendado)
+
+O instalador pergunta, numa tela só, quais endereços o agente já aceita — assim
+ninguém precisa clicar em **Autorizar acesso** na bandeja. São dois campos, os
+dois opcionais:
+
+- **Endereço do sistema** (`SISTEMA_URL`): autoriza a origem **e** habilita o
+  menu "Abrir sistema" na bandeja.
+- **Outros endereços autorizados** (`CORS_ORIGEM`): lista separada por vírgula,
+  para quando o sistema é alcançado por mais de um endereço.
+
+Cada endereço é uma origem distinta: `https://sistema:8081`, `https://sistema` e
+`https://10.0.0.5:8081` **não** se equivalem. Se o sistema for acessado de mais
+de uma forma, todas precisam entrar.
+
+Para instalar sem interface:
+
+```
+msiexec /i AgenteBiometria.msi /qn SISTEMA_URL="https://sistema.exemplo:8081"
+```
+
+Os valores viram variáveis de ambiente **da máquina**. Isso significa que **uma
+sessão RDP já aberta não as enxerga**: quem já estava logado precisa sair e
+entrar. Na prática não custa nada, porque o agente só troca de versão no logon
+seguinte de qualquer jeito.
+
+Dá para mudar depois sem reinstalar, editando as variáveis de máquina — mas aí
+também vale o logoff.
+
+### Pelo script PowerShell
 
 Rode como administrador, com o exe ao lado do script:
 
