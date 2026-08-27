@@ -102,6 +102,30 @@ func exigeReinicioSDK(err error) bool {
 	return errors.As(err, &e) && e.exigeReinicio()
 }
 
+// erroDeDispositivo diz se o erro significa "o leitor nao esta ai", e nao
+// "a leitura nao deu certo".
+//
+// A distincao existe por causa do icone da bandeja: um dedo falso (0x0204), um
+// tempo esgotado (0x0203) ou uma captura cancelada pelo usuario (0x0201) sao
+// desfechos rotineiros de quem acabou de encostar o dedo no leitor. Tratar
+// esses como ausencia de leitor faria o icone dizer "sem leitor" logo depois de
+// o leitor ter funcionado.
+func erroDeDispositivo(err error) bool {
+	var e *erroSDK
+	if !errors.As(err, &e) {
+		return false
+	}
+	switch e.codigo {
+	case 0x0101, // falha ao abrir o dispositivo
+		0x0102, // nenhum leitor encontrado
+		0x010A, // falha ao inicializar o dispositivo
+		0x010B, // dispositivo perdido ou desconectado
+		0x010C: // falha ao carregar a DLL do dispositivo
+		return true
+	}
+	return false
+}
+
 // Layout de NBioAPI_INPUT_FIR e NBioAPI_FIR_TEXTENCODE em 32 bits, como
 // montados por novaInputFIRNativa:
 //

@@ -1,0 +1,112 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Uma tela so, para perguntar quais enderecos o agente ja aceita.
+
+  Conjunto de dialogos proprio em vez de um dos prontos (WixUI_Minimal,
+  WixUI_InstallDir, WixUI_Mondo): todos eles incluem uma tela de licenca que
+  exige RTF, e a pasta de instalacao aqui nao e negociavel - o pacote e x86 de
+  proposito, porque a NBioBSP.dll so existe em 32 bits. Sobrava uma unica
+  pergunta de verdade, e e essa.
+
+  Os campos ficam vazios de proposito. Um valor sugerido dentro do pacote seria
+  aceito no automatico e nao teria como ser corrigido sem gerar MSI novo.
+
+  Quem automatiza nao ve tela nenhuma:
+    msiexec /i AgenteBiometria.msi /qn SISTEMA_URL="https://..." CORS_ORIGEM="https://..."
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
+
+  <Fragment>
+    <UI Id="UiAgente">
+      <!-- Os dialogos comuns (progresso, erro, cancelamento, saida) vem do
+           WixUI_Common, referenciado no fim. Os estilos de texto, nao: o
+           WixUI_Common usa WixUI_Font_* mas quem os define sao os conjuntos
+           prontos, que nao estamos usando. Sem estas quatro linhas o ICE31
+           reprova o pacote, e os proprios dialogos da WiX ficam sem fonte.
+           Tahoma 8 e o padrao dos conjuntos da WiX; manter igual evita uma tela
+           nossa destoando das dela. -->
+      <TextStyle Id="WixUI_Font_Normal" FaceName="Tahoma" Size="8" />
+      <TextStyle Id="WixUI_Font_Bigger" FaceName="Tahoma" Size="12" />
+      <TextStyle Id="WixUI_Font_Title" FaceName="Tahoma" Size="9" Bold="yes" />
+      <TextStyle Id="WixUI_Font_Emphasized" FaceName="Tahoma" Size="8" Bold="yes" />
+      <Property Id="DefaultUIFont" Value="WixUI_Font_Normal" />
+
+      <DialogRef Id="ErrorDlg" />
+      <DialogRef Id="ExitDialog" />
+      <DialogRef Id="FatalError" />
+      <DialogRef Id="FilesInUse" />
+      <DialogRef Id="MsiRMFilesInUse" />
+      <DialogRef Id="PrepareDlg" />
+      <DialogRef Id="ProgressDlg" />
+      <DialogRef Id="UserExit" />
+
+      <Dialog Id="OrigensDlg" Width="370" Height="270" Title="Agente de Biometria">
+
+        <Control Id="Banner" Type="Bitmap" X="0" Y="0" Width="370" Height="44"
+                 TabSkip="no" Text="WixUI_Bmp_Banner" />
+        <Control Id="Titulo" Type="Text" X="15" Y="6" Width="200" Height="15"
+                 Transparent="yes" NoPrefix="yes"
+                 Text="{\WixUI_Font_Title}Enderecos do sistema" />
+        <Control Id="Subtitulo" Type="Text" X="25" Y="23" Width="330" Height="15"
+                 Transparent="yes" NoPrefix="yes"
+                 Text="Informe onde o sistema web e publicado." />
+        <Control Id="LinhaTopo" Type="Line" X="0" Y="44" Width="370" Height="0" />
+
+        <Control Id="Explicacao" Type="Text" X="20" Y="58" Width="330" Height="34"
+                 NoPrefix="yes"
+                 Text="O agente so responde a paginas de enderecos autorizados. Preenchendo aqui, ninguem precisa clicar em &quot;Autorizar acesso&quot; na bandeja. Pode deixar em branco e autorizar depois, por usuario." />
+
+        <Control Id="RotuloSistema" Type="Text" X="20" Y="100" Width="330" Height="10"
+                 NoPrefix="yes" Text="&amp;Endereco do sistema (habilita tambem o menu &quot;Abrir sistema&quot;):" />
+        <Control Id="CampoSistema" Type="Edit" X="20" Y="113" Width="330" Height="18"
+                 Property="SISTEMA_URL" Indirect="no" />
+        <Control Id="ExemploSistema" Type="Text" X="20" Y="134" Width="330" Height="10"
+                 NoPrefix="yes" Text="Exemplo: https://sistema.exemplo:8443" />
+
+        <Control Id="RotuloCors" Type="Text" X="20" Y="158" Width="330" Height="10"
+                 NoPrefix="yes" Text="&amp;Outros enderecos autorizados (separados por virgula):" />
+        <Control Id="CampoCors" Type="Edit" X="20" Y="171" Width="330" Height="18"
+                 Property="CORS_ORIGEM" Indirect="no" />
+        <Control Id="ExemploCors" Type="Text" X="20" Y="192" Width="330" Height="20"
+                 NoPrefix="yes"
+                 Text="Cada endereco e uma origem distinta: com e sem porta, por IP ou por outro nome nao se equivalem." />
+
+        <Control Id="LinhaRodape" Type="Line" X="0" Y="234" Width="370" Height="0" />
+
+        <Control Id="Instalar" Type="PushButton" X="236" Y="243" Width="56" Height="17"
+                 Default="yes" Text="&amp;Instalar">
+          <Publish Event="EndDialog" Value="Return" />
+        </Control>
+        <Control Id="Cancelar" Type="PushButton" X="304" Y="243" Width="56" Height="17"
+                 Cancel="yes" Text="Cancelar">
+          <Publish Event="SpawnDialog" Value="CancelDlg" />
+        </Control>
+      </Dialog>
+
+      <!-- O botao Concluir do ExitDialog vem sem acao do WixUI_Common: quem
+           liga cada um deles sao os conjuntos prontos. Sem esta linha o ICE17
+           reprova, e na pratica o botao nao fecharia o instalador. -->
+      <Publish Dialog="ExitDialog" Control="Finish" Event="EndDialog" Value="Return" Order="999" />
+
+      <!-- So na instalacao. Numa desinstalacao ou reparo nao ha o que perguntar,
+           e as variaveis ja gravadas continuam valendo. -->
+      <InstallUISequence>
+        <Show Dialog="OrigensDlg" Before="ProgressDlg" Condition="NOT Installed" />
+        <!-- Os tres desfechos. Sem eles o ICE20 reprova o pacote, e uma
+             instalacao cancelada ou com erro fecharia sem dizer nada. -->
+        <Show Dialog="ExitDialog" OnExit="success" />
+        <Show Dialog="UserExit" OnExit="cancel" />
+        <Show Dialog="FatalError" OnExit="error" />
+      </InstallUISequence>
+
+      <AdminUISequence>
+        <Show Dialog="ExitDialog" OnExit="success" />
+        <Show Dialog="UserExit" OnExit="cancel" />
+        <Show Dialog="FatalError" OnExit="error" />
+      </AdminUISequence>
+    </UI>
+
+    <UIRef Id="WixUI_Common" />
+  </Fragment>
+</Wix>

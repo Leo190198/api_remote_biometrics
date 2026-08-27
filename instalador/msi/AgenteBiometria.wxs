@@ -17,7 +17,8 @@
   portanto sem depender de logoff para a sessao enxergar a mudanca.
 -->
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
-     xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
+     xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util"
+     xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
 
   <Package
       Name="Agente de Biometria"
@@ -43,6 +44,19 @@
     <Icon Id="AppIcon" SourceFile="$(var.PastaFontes)\app.ico" />
     <Property Id="ARPPRODUCTICON" Value="AppIcon" />
     <Property Id="ARPNOREPAIR" Value="1" />
+
+    <!-- Origens que o agente ja aceita sem ninguem clicar em "Autorizar
+         acesso" na bandeja. Sao lidas do ambiente da maquina no arranque de
+         cada agente (origins.go), entao valem para todos os usuarios.
+
+         Publicas e Secure="yes" porque precisam atravessar a elevacao numa
+         instalacao por maquina: sem isso, o valor digitado no dialogo (ou
+         passado na linha de comando) nao chega na parte elevada do install e
+         a variavel sairia vazia. -->
+    <Property Id="SISTEMA_URL" Secure="yes" />
+    <Property Id="CORS_ORIGEM" Secure="yes" />
+
+    <UIRef Id="UiAgente" />
 
     <Feature Id="Principal" Title="Agente de Biometria" Level="1">
       <ComponentGroupRef Id="Componentes" />
@@ -124,6 +138,14 @@
         <CreateFolder />
         <RemoveFile Id="RemoveAnuncio" Name="comparador.json" On="uninstall" />
         <RemoveFile Id="RemoveLogComparador" Name="comparador.log" On="uninstall" />
+        <RemoveFile Id="RemoveLogComparadorAntigo" Name="comparador.log.1" On="uninstall" />
+        <!-- O certificado da maquina e a chave dele tambem nascem em tempo de
+             execucao, criados pelo servico. O RemoveCertMaquina abaixo ja os
+             apaga junto com o registro na loja Root; estas linhas cobrem o caso
+             de a acao customizada ter falhado, para nao deixar chave privada
+             para tras. -->
+        <RemoveFile Id="RemoveCertPem" Name="cert.pem" On="uninstall" />
+        <RemoveFile Id="RemoveKeyPem" Name="key.pem" On="uninstall" />
         <RemoveFolder Id="RemovePastaDados" On="uninstall" />
         <RegistryValue
             Root="HKLM"
@@ -134,6 +156,85 @@
             KeyPath="yes" />
       </Component>
 
+      <!-- As origens pre-autorizadas, gravadas como variaveis de ambiente da
+           MAQUINA: o agente de cada sessao le SISTEMA_URL e CORS_ORIGEM no
+           arranque (origins.go), entao vale para todos os usuarios.
+
+           Cada componente tem condicao: campo em branco no dialogo nao pode
+           gravar variavel vazia. E o RegistryValue existe para ser o KeyPath -
+           Environment nao serve de KeyPath - e de quebra deixa registrado o que
+           foi configurado, para quem for diagnosticar depois nao ter que
+           adivinhar de onde veio a autorizacao.
+
+           Atencao operacional: variavel de maquina so e enxergada por sessao
+           aberta DEPOIS da instalacao. Quem ja esta logado precisa sair e
+           entrar para o agente dele receber a origem. -->
+      <Component Id="CompSistemaUrl" Directory="PASTAINSTALACAO" Guid="*" Condition="SISTEMA_URL">
+        <RegistryValue
+            Root="HKLM"
+            Key="SOFTWARE\Sermed\AgenteBiometria"
+            Name="SistemaUrl"
+            Type="string"
+            Value="[SISTEMA_URL]"
+            KeyPath="yes" />
+        <Environment
+            Id="EnvSistemaUrl"
+            Name="SISTEMA_URL"
+            Value="[SISTEMA_URL]"
+            Action="set"
+            System="yes"
+            Part="all"
+            Permanent="no" />
+      </Component>
+
+      <Component Id="CompCorsOrigem" Directory="PASTAINSTALACAO" Guid="*" Condition="CORS_ORIGEM">
+        <RegistryValue
+            Root="HKLM"
+            Key="SOFTWARE\Sermed\AgenteBiometria"
+            Name="CorsOrigem"
+            Type="string"
+            Value="[CORS_ORIGEM]"
+            KeyPath="yes" />
+        <Environment
+            Id="EnvCorsOrigem"
+            Name="CORS_ORIGEM"
+            Value="[CORS_ORIGEM]"
+            Action="set"
+            System="yes"
+            Part="all"
+            Permanent="no" />
+      </Component>
+
     </ComponentGroup>
+
+    <!-- Tira da loja Root da maquina o certificado que o servico registrou.
+         Sem isto, desinstalar o agente deixaria para tras uma raiz confiavel
+         que ninguem sabe de onde veio - e o proprio exe e quem sabe qual
+         registro apagar, porque ele guarda o certificado em disco e calcula o
+         thumbprint a partir dele.
+
+         Return="ignore" de proposito: um certutil que falhe nao pode impedir a
+         desinstalacao. O RemoveFile do CompDados ainda leva a chave privada
+         embora, que e a parte que realmente nao pode ficar. -->
+    <CustomAction
+        Id="PreparaRemocaoCertMaquina"
+        Property="RemoveCertMaquina"
+        Value="&quot;[#AgenteBiometriaExe]&quot; --remover-cert-maquina"
+        Execute="immediate" />
+
+    <CustomAction
+        Id="RemoveCertMaquina"
+        BinaryRef="Wix4UtilCA_X86"
+        DllEntry="Wix4QuietExec_X86"
+        Execute="deferred"
+        Impersonate="no"
+        Return="ignore" />
+
+    <InstallExecuteSequence>
+      <!-- Antes do RemoveFiles porque a acao roda o proprio exe: depois dele o
+           binario ja nao existe mais. -->
+      <Custom Action="PreparaRemocaoCertMaquina" Before="RemoveCertMaquina" Condition="REMOVE=&quot;ALL&quot;" />
+      <Custom Action="RemoveCertMaquina" Before="RemoveFiles" Condition="REMOVE=&quot;ALL&quot;" />
+    </InstallExecuteSequence>
   </Fragment>
 </Wix>
